@@ -1,120 +1,142 @@
-import React, { useState } from 'react';
-import Header from '../components/Header';
-import { CheckCircle, AlertTriangle, Info, XCircle } from 'lucide-react';
-import { formatDate, severityColor } from '../utils/helpers';
+import { useState, useEffect } from 'react';
+import { getAlerts, markAlertsRead, getReadings, getSettings } from '../utils/storage';
+import { Bell, BellOff, CheckCheck, AlertTriangle, AlertOctagon } from 'lucide-react';
 
-function SeverityIcon({ severity }) {
-  if (severity === 'critical') return <XCircle      size={14} style={{ color: '#ff4444' }} />;
-  if (severity === 'warning')  return <AlertTriangle size={14} style={{ color: '#ffd700' }} />;
-  return                              <Info          size={14} style={{ color: '#00d4ff' }} />;
+function timeAgo(ts) {
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h/24)}d ago`;
 }
 
-export default function Alerts({ alertLog, acknowledgeAlert }) {
-  const [filter, setFilter] = useState('all');
+export default function AlertsPage() {
+  const [alerts, setAlerts] = useState([]);
+  const [statusReport, setStatusReport] = useState(null);
+  const [lastCheck, setLastCheck] = useState(null);
 
-  const filtered = alertLog.filter(a => {
-    if (filter === 'active')   return !a.resolved;
-    if (filter === 'resolved') return  a.resolved;
-    if (filter === 'critical') return  a.severity === 'critical';
-    return true;
-  });
+  useEffect(() => {
+    const load = () => setAlerts(getAlerts());
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, []);
 
-  const active    = alertLog.filter(a => !a.resolved).length;
-  const critical  = alertLog.filter(a => a.severity === 'critical' && !a.resolved).length;
-  const warnings  = alertLog.filter(a => a.severity === 'warning'  && !a.resolved).length;
-  const resolved  = alertLog.filter(a =>  a.resolved).length;
+  useEffect(() => {
+    generateReport();
+    const t = setInterval(generateReport, 3 * 60 * 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  function generateReport() {
+    const readings = getReadings();
+    const settings = getSettings();
+    if (!readings.length) return;
+    const last3h = readings.filter(r => r.timestamp > Date.now() - 3 * 60 * 60 * 1000);
+    if (!last3h.length) return;
+    const avgTemp = last3h.reduce((a, r) => a + (r.temperature_c || 0), 0) / last3h.length;
+    const avgVib  = last3h.reduce((a, r) => a + (r.vibration_rms_mm_s2 || 0), 0) / last3h.length;
+    const avgCurr = last3h.reduce((a, r) => a + (r.spindle_current_a || 0), 0) / last3h.length;
+    const maxTemp = Math.max(...last3h.map(r => r.temperature_c || 0));
+    const failedCount = last3h.filter(r => r.tool_status === 'failed').length;
+    let overall = 'good';
+    const issues = [];
+    if (avgTemp > settings.tempLimit * 0.9) { overall = 'warning'; issues.push(`High avg temp: ${avgTemp.toFixed(1)}°C`); }
+    if (avgVib  > settings.vibLimit  * 0.9) { overall = 'warning'; issues.push(`High avg vibration: ${avgVib.toFixed(1)} mm/s²`); }
+    if (maxTemp > settings.tempLimit)        { overall = 'critical'; issues.push(`EXCEEDED temp limit: ${maxTemp.toFixed(1)}°C`); }
+    if (failedCount > 0)                     { overall = 'critical'; issues.push(`${failedCount} failed readings detected`); }
+    setStatusReport({ overall, issues, avgTemp, avgVib, avgCurr, failedCount, readingsCount: last3h.length });
+    setLastCheck(new Date());
+  }
+
+  const unread = alerts.filter(a => !a.read).length;
 
   return (
-    <div className="flex-1 overflow-auto">
-      <Header title="Alert Center" subtitle="Monitor and acknowledge system alerts" alertCount={active} />
-      <div className="p-8 grid-bg min-h-screen">
+    <div className="p-6 space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Alert Center</h1>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">Maintenance & Status Reports</div>
+        </div>
+        <button onClick={() => { markAlertsRead(); setAlerts(getAlerts()); }}
+          className="flex items-center gap-2 text-xs text-[#849396] hover:text-[#c3f5ff] border border-[#3b494c]/40 px-3 py-2 rounded-xl transition-colors">
+          <CheckCheck size={13}/> Mark all read
+        </button>
+      </div>
 
-        {/* Summary cards */}
-        <div className="grid grid-cols-4 gap-4 mb-6">
-          {[
-            { label: 'Active Alerts', value: active,   color: active   > 0 ? '#ff4444' : '#00ff88', icon: AlertTriangle },
-            { label: 'Critical',      value: critical, color: critical > 0 ? '#ff4444' : '#00ff88', icon: XCircle },
-            { label: 'Warnings',      value: warnings, color: warnings > 0 ? '#ffd700' : '#00ff88', icon: AlertTriangle },
-            { label: 'Resolved',      value: resolved, color: '#00ff88',                             icon: CheckCircle  },
-          ].map(c => (
-            <div key={c.label} className="rounded-2xl p-5 card-hover"
-              style={{ background: '#111827', border: `1px solid ${c.color}33` }}>
-              <div className="flex items-center justify-between mb-3">
-                <c.icon size={18} style={{ color: c.color }} />
-              </div>
-              <p className="text-3xl font-bold font-mono" style={{ color: c.color }}>{c.value}</p>
-              <p className="text-xs mt-1" style={{ color: '#64748b' }}>{c.label}</p>
+      <div className="bg-[#181c22] rounded-xl p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <Bell size={14} className="text-[#00daf3]"/>
+          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">3-Hour Status Report</span>
+          {lastCheck && <span className="text-[9px] text-[#3b494c] ml-auto">Last: {lastCheck.toLocaleTimeString()}</span>}
+          <button onClick={generateReport} className="text-[9px] uppercase tracking-widest text-[#849396] hover:text-[#c3f5ff] ml-2 border border-[#3b494c]/30 px-2 py-0.5 rounded transition-colors">Refresh</button>
+        </div>
+        {statusReport ? (
+          <div className={`rounded-xl p-4 border ${
+            statusReport.overall === 'good'     ? 'bg-[#00e5ff]/5 border-[#00e5ff]/15' :
+            statusReport.overall === 'warning'  ? 'bg-[#feb300]/5 border-[#feb300]/15' :
+            'bg-[#93000a]/10 border-[#ffb4ab]/20'}`}>
+            <div className="flex items-center gap-3 mb-3">
+              {statusReport.overall === 'good' ? <Bell size={16} className="text-[#00e5ff]"/> :
+               statusReport.overall === 'warning' ? <AlertTriangle size={16} className="text-[#ffba38]"/> :
+               <AlertOctagon size={16} className="text-[#ffb4ab] flash-alert"/>}
+              <span className={`font-bold text-sm font-headline uppercase tracking-wider ${
+                statusReport.overall === 'good' ? 'text-[#00e5ff]' :
+                statusReport.overall === 'warning' ? 'text-[#ffba38]' : 'text-[#ffb4ab]'}`}>
+                Machine Status: {statusReport.overall.toUpperCase()}
+              </span>
             </div>
-          ))}
-        </div>
-
-        {/* Filter tabs */}
-        <div className="flex gap-2 mb-4">
-          {['all', 'active', 'critical', 'resolved'].map(f => (
-            <button key={f} onClick={() => setFilter(f)}
-              className="px-4 py-2 rounded-xl text-xs font-mono uppercase tracking-widest transition-all"
-              style={{
-                background: filter === f ? '#00d4ff18' : '#111827',
-                color:      filter === f ? '#00d4ff'   : '#64748b',
-                border:     `1px solid ${filter === f ? '#00d4ff33' : '#1e3a5f'}`,
-              }}>
-              {f}
-            </button>
-          ))}
-        </div>
-
-        {/* Alert table */}
-        <div className="rounded-2xl overflow-hidden" style={{ background: '#111827', border: '1px solid #1e3a5f' }}>
-          <table className="w-full text-sm">
-            <thead>
-              <tr style={{ borderBottom: '1px solid #1e3a5f', fontSize: 10 }}>
-                {['ID', 'Severity', 'Alert', 'Machine', 'Time', 'Status', 'Action'].map(h => (
-                  <th key={h} className="px-5 py-3 text-left font-mono tracking-widest" style={{ color: '#64748b' }}>{h}</th>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
+              <div><div className="text-[#849396] text-[9px] uppercase tracking-wider">Avg Temp</div><div className="text-[#dfe2eb] font-bold">{statusReport.avgTemp.toFixed(1)}°C</div></div>
+              <div><div className="text-[#849396] text-[9px] uppercase tracking-wider">Avg Vibration</div><div className="text-[#dfe2eb] font-bold">{statusReport.avgVib.toFixed(1)} mm/s²</div></div>
+              <div><div className="text-[#849396] text-[9px] uppercase tracking-wider">Avg Current</div><div className="text-[#dfe2eb] font-bold">{statusReport.avgCurr.toFixed(1)} A</div></div>
+              <div><div className="text-[#849396] text-[9px] uppercase tracking-wider">Readings (3h)</div><div className="text-[#dfe2eb] font-bold">{statusReport.readingsCount}</div></div>
+            </div>
+            {statusReport.issues.length > 0 ? (
+              <div className="space-y-1">
+                {statusReport.issues.map((issue, i) => (
+                  <div key={i} className="flex items-center gap-2 text-xs text-[#ffba38]">
+                    <span className="w-1 h-1 rounded-full bg-[#ffba38] flex-shrink-0"/>
+                    {issue}
+                  </div>
                 ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.length === 0 && (
-                <tr><td colSpan={7} className="px-5 py-12 text-center" style={{ color: '#334155' }}>No alerts match this filter</td></tr>
-              )}
-              {filtered.map(a => (
-                <tr key={a.id} className="border-b transition-all hover:bg-white hover:bg-opacity-5"
-                  style={{ borderColor: '#1e3a5f18' }}>
-                  <td className="px-5 py-3 font-mono text-xs" style={{ color: '#64748b' }}>{a.id}</td>
-                  <td className="px-5 py-3">
-                    <span className="flex items-center gap-1.5 text-xs"
-                      style={{ color: severityColor(a.severity) }}>
-                      <SeverityIcon severity={a.severity} />
-                      {a.severity}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3 text-xs" style={{ color: a.resolved ? '#64748b' : '#e2e8f0' }}>{a.label}</td>
-                  <td className="px-5 py-3 font-mono text-xs" style={{ color: '#00d4ff' }}>{a.machineId}</td>
-                  <td className="px-5 py-3 text-xs font-mono" style={{ color: '#64748b' }}>{formatDate(a.ts)}</td>
-                  <td className="px-5 py-3">
-                    <span className="text-xs px-2 py-0.5 rounded-full font-mono"
-                      style={{
-                        background: a.resolved ? '#00ff8815' : '#ff444415',
-                        color:      a.resolved ? '#00ff88'   : '#ff4444',
-                        border:     `1px solid ${a.resolved ? '#00ff8833' : '#ff444433'}`,
-                      }}>
-                      {a.resolved ? 'RESOLVED' : 'ACTIVE'}
-                    </span>
-                  </td>
-                  <td className="px-5 py-3">
-                    {!a.resolved && (
-                      <button onClick={() => acknowledgeAlert(a.id)}
-                        className="text-xs px-3 py-1 rounded-lg transition-all hover:opacity-80"
-                        style={{ background: '#00ff8818', color: '#00ff88', border: '1px solid #00ff8833' }}>
-                        ACK
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+              </div>
+            ) : (
+              <div className="text-xs text-[#00e5ff]">✓ All parameters within normal limits over the last 3 hours.</div>
+            )}
+          </div>
+        ) : (
+          <div className="text-xs text-[#849396]">No readings yet — connect sensors to generate status reports.</div>
+        )}
+      </div>
+
+      <div className="bg-[#181c22] rounded-xl p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <AlertTriangle size={14} className="text-[#ffba38]"/>
+          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Alert Feed</span>
+          {unread > 0 && <span className="bg-[#ffb4ab]/20 text-[#ffb4ab] text-[9px] px-2 py-0.5 rounded-full ml-auto">{unread} new</span>}
         </div>
+        {alerts.length === 0 ? (
+          <div className="text-center py-8 text-[#849396] text-sm">
+            <BellOff size={24} className="mx-auto mb-2 opacity-40"/>
+            No alerts yet. Machine is running normally.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {alerts.slice(0, 50).map((a) => (
+              <div key={a.id} className={`flex items-center gap-3 p-3 rounded-xl text-xs border transition-all
+                ${!a.read ? 'bg-[#1c2026] border-[#3b494c]/30' : 'bg-[#181c22] border-transparent opacity-60'}`}>
+                <span className={`w-2 h-2 rounded-full flex-shrink-0 ${a.type === 'error' ? 'bg-[#ffb4ab]' : 'bg-[#ffba38]'}`}/>
+                <span className={`font-bold ${a.type === 'error' ? 'text-[#ffb4ab]' : 'text-[#ffba38]'}`}>{a.param}</span>
+                <span className="text-[#dfe2eb]">{a.value?.toFixed?.(1) ?? a.value} {a.unit}</span>
+                <span className="text-[#849396]">› limit {a.limit} {a.unit}</span>
+                <span className="text-[#3b494c] ml-auto">{timeAgo(a.timestamp)}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
