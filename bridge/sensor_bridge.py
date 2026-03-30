@@ -1,211 +1,206 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v2.0
+Broaching Machine Sensor Bridge v3.0
 ======================================
-Run on the Windows PC next to the machine.
-Reads USB sensors, sends real data to browser via WebSocket.
+Reads ALL 3 sensors through a SINGLE Arduino Uno COM port.
+Arduino sends one line per second:
+  TEMP:25.30,VIB:0.45,CURR:2.10
 
-INSTALL:  pip install pyserial websockets aiohttp
+INSTALL:  pip install pyserial websockets
 RUN:      python sensor_bridge.py
-AI:       set AI_API_KEY=sk-... && python sensor_bridge.py
-
-Your sensors should output simple lines via serial (USB):
-  Temperature: '79.5' or 'TEMP:79.5'
-  Vibration:   '24.3' or 'VIB:24.3'
-  Current:     '38.7' or 'CURR:38.7'
 """
 
-import asyncio, json, os, re, logging
+import asyncio, json, re, logging, sys
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-HOST = 'localhost'
-PORT = 8765
-READ_INTERVAL = 1.0
-AI_API_KEY = os.environ.get('AI_API_KEY', '')
+HOST          = 'localhost'
+WS_PORT       = 8765
+BAUD_RATE     = 9600
+READ_INTERVAL = 0.1  # poll serial frequently
 
-# Set your COM ports here, or leave None to auto-detect
-TEMP_PORT    = None  # e.g. 'COM3'
-VIB_PORT     = None  # e.g. 'COM4'
-CURRENT_PORT = None  # e.g. 'COM5'
+# ── Set your Arduino COM port here ──────────────────────────────────────────
+# Leave as None to auto-detect the first available port
+ARDUINO_PORT = None   # e.g. 'COM3'
+# ────────────────────────────────────────────────────────────────────────────
 
 try:
-    import serial, serial.tools.list_ports
+    import serial
+    import serial.tools.list_ports
     SERIAL_OK = True
 except ImportError:
     SERIAL_OK = False
-    log.warning('pyserial not installed. Run: pip install pyserial')
+    log.error('pyserial not installed. Run: pip install pyserial')
+    sys.exit(1)
 
 try:
     import websockets
 except ImportError:
     log.error('websockets not installed. Run: pip install websockets')
-    exit(1)
-
-try:
-    from aiohttp import web
-    AIOHTTP_OK = True
-except ImportError:
-    AIOHTTP_OK = False
+    sys.exit(1)
 
 
-class SensorReader:
-    def __init__(self, port, baud=9600, label='sensor'):
-        self.port = port; self.baud = baud; self.label = label
-        self.ser = None; self.last_value = None
-
-    def connect(self):
-        try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
-            log.info(f'[{self.label}] Connected to {self.port}')
-            return True
-        except Exception as e:
-            log.warning(f'[{self.label}] Cannot open {self.port}: {e}')
-            return False
-
-    def read(self):
-        try:
-            if not self.ser or not self.ser.is_open:
-                self.connect(); return self.last_value
-            line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-            if not line: return self.last_value
-            v = float(re.sub(r'[^0-9.\-]', '', line.split(':')[-1].strip()))
-            self.last_value = v
-            return v
-        except Exception as e:
-            log.debug(f'[{self.label}] Read error: {e}')
-            return self.last_value
+def auto_detect_port():
+    """Find the first available COM port (Arduino usually shows as USB Serial)."""
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        return None
+    for p in ports:
+        log.info(f'Found port: {p.device} — {p.description}')
+    # Prefer a port with "Arduino" or "CH340" or "USB" in description
+    for p in ports:
+        desc = (p.description or '').lower()
+        if any(x in desc for x in ['arduino', 'ch340', 'ch341', 'usb serial', 'usb-serial', 'uart']):
+            log.info(f'Auto-selected: {p.device}')
+            return p.device
+    # fallback: first port
+    log.info(f'Auto-selected (fallback): {ports[0].device}')
+    return ports[0].device
 
 
-def estimate_derived(temp, vib, current):
-    """Physics-based estimation of unmeasured parameters."""
-    force = max(2500, min(11500, current * 240 + vib * 15 + (temp - 77) * 50))
-    ae    = max(300,  min(650,   current * 12  + vib * 2.5 + 200))
+def parse_line(line: str):
+    """
+    Parse a line from Arduino.
+    Expected format: TEMP:25.30,VIB:0.45,CURR:2.10
+    Returns (temp, vib, current) floats or None if parse fails.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        temp = vib = curr = None
+        # Try labeled format: TEMP:x,VIB:y,CURR:z
+        t_m = re.search(r'TEMP[:\s]+([-\d.]+)', line, re.IGNORECASE)
+        v_m = re.search(r'VIB[:\s]+([-\d.]+)',  line, re.IGNORECASE)
+        c_m = re.search(r'CURR[:\s]+([-\d.]+)', line, re.IGNORECASE)
+        if t_m: temp = float(t_m.group(1))
+        if v_m: vib  = float(v_m.group(1))
+        if c_m: curr = float(c_m.group(1))
+        if temp is not None and vib is not None and curr is not None:
+            return temp, vib, curr
+        # Fallback: plain CSV "25.30,0.45,2.10"
+        parts = [p.strip() for p in line.split(',')]
+        if len(parts) >= 3:
+            return float(parts[0]), float(parts[1]), float(parts[2])
+    except Exception as e:
+        log.debug(f'Parse error on line "{line}": {e}')
+    return None
+
+
+def derive_params(temp, vib, curr):
+    """Physics-based estimation of unmeasured parameters from the 3 sensor values."""
+    force = max(2500, min(11500, curr * 240 + vib * 15 + (temp - 77) * 50))
+    ae    = max(300,  min(650,   curr * 12 + vib * 2.5 + 200))
     wear  = min(1.5,  max(0,     (vib - 6) / 31 * 1.5))
-    if   vib > 33 or temp > 88 or current > 44: status = 'failed'
-    elif vib > 28 or temp > 82 or current > 41: status = 'worn'
-    else:                                        status = 'new'
+    if   vib > 33 or temp > 88 or curr > 44: status = 'failed'
+    elif vib > 28 or temp > 82 or curr > 41: status = 'worn'
+    else:                                     status = 'new'
     sf = 0.5 if status == 'new' else (0.8 if status == 'worn' else 1.2)
     return {
-        'cutting_force_n':     round(force, 1),
+        'cutting_force_n':      round(force, 1),
         'acoustic_emission_db': round(ae, 1),
         'surface_finish_ra_um': sf,
-        'wear_progression':    round(wear, 3),
-        'tool_status':         status,
-        'spindle_speed_mmin':  round(15 + (current - 38) * 0.5, 1),
-        'feed_rate_mmtooth':   round(0.065 + (temp - 77) * 0.001, 3),
-        'coolant_flow_lmin':   round(18 + (temp - 77) * 0.2, 1),
+        'wear_progression':     round(wear, 3),
+        'tool_status':          status,
+        'spindle_speed_mmin':   round(15 + (curr - 38) * 0.5, 1),
+        'feed_rate_mmtooth':    round(0.065 + (temp - 77) * 0.001, 3),
+        'coolant_flow_lmin':    round(18 + (temp - 77) * 0.2, 1),
     }
 
 
-async def get_derived(temp, vib, current, api_key):
-    if not api_key:
-        return estimate_derived(temp, vib, current)
-    try:
-        import aiohttp
-        prompt = (f'Broaching machine: Temp={temp:.1f}C, Vib={vib:.2f}mm/s2, Current={current:.2f}A. '
-                  'Return JSON only: cutting_force_n, acoustic_emission_db, surface_finish_ra_um, '
-                  'wear_progression(0-1.5), tool_status(new/worn/failed), spindle_speed_mmin, '
-                  'feed_rate_mmtooth, coolant_flow_lmin')
-        async with aiohttp.ClientSession() as s:
-            async with s.post('https://api.openai.com/v1/chat/completions',
-                headers={'Authorization': f'Bearer {api_key}'},
-                json={'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 250},
-                timeout=aiohttp.ClientTimeout(total=5)) as r:
-                res = await r.json()
-                m = re.search(r'\{.*\}', res['choices'][0]['message']['content'], re.DOTALL)
-                if m: return json.loads(m.group())
-    except Exception as e:
-        log.debug(f'AI error: {e}')
-    return estimate_derived(temp, vib, current)
-
-
-connected = set()
+# ── WebSocket server ─────────────────────────────────────────────────────────
+connected_clients = set()
 
 async def ws_handler(websocket):
-    connected.add(websocket)
-    log.info(f'Browser connected ({len(connected)} clients)')
-    try: await websocket.wait_closed()
+    connected_clients.add(websocket)
+    log.info(f'Browser connected — {len(connected_clients)} client(s)')
+    try:
+        await websocket.wait_closed()
     finally:
-        connected.discard(websocket)
-        log.info(f'Browser disconnected ({len(connected)} clients)')
+        connected_clients.discard(websocket)
+        log.info(f'Browser disconnected — {len(connected_clients)} client(s)')
 
 
-async def broadcast(data):
-    if not connected: return
-    msg = json.dumps(data)
+async def broadcast(payload: dict):
+    if not connected_clients:
+        return
+    msg  = json.dumps(payload)
     dead = set()
-    for c in list(connected):
-        try: await c.send(msg)
-        except: dead.add(c)
-    connected.difference_update(dead)
+    for client in list(connected_clients):
+        try:
+            await client.send(msg)
+        except Exception:
+            dead.add(client)
+    connected_clients.difference_update(dead)
 
 
-def auto_detect_ports():
-    if not SERIAL_OK: return None, None, None
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    log.info(f'Available COM ports: {ports}')
-    return (ports + [None, None, None])[:3]
-
-
-async def sensor_loop(t_s, v_s, c_s):
+# ── Serial reading loop ──────────────────────────────────────────────────────
+async def serial_loop(port: str):
+    ser = None
     cycle = 0
     while True:
-        await asyncio.sleep(READ_INTERVAL)
-        cycle += 1
-        temp = t_s.read() if t_s else None
-        vib  = v_s.read()  if v_s  else None
-        curr = c_s.read()  if c_s  else None
-        if all(v is None for v in [temp, vib, curr]):
+        # Try to (re)connect
+        if ser is None or not ser.is_open:
+            try:
+                ser = serial.Serial(port, BAUD_RATE, timeout=1)
+                log.info(f'Opened {port} at {BAUD_RATE} baud')
+            except Exception as e:
+                log.warning(f'Cannot open {port}: {e}  — retrying in 3s')
+                await asyncio.sleep(3)
+                continue
+        # Read one line
+        try:
+            raw = ser.readline().decode('utf-8', errors='ignore')
+        except Exception as e:
+            log.warning(f'Read error: {e}')
+            ser = None
+            await asyncio.sleep(1)
             continue
-        temp = temp or 25.0; vib = vib or 0.0; curr = curr or 0.0
-        derived = await get_derived(temp, vib, curr, AI_API_KEY)
+        result = parse_line(raw)
+        if result is None:
+            await asyncio.sleep(READ_INTERVAL)
+            continue
+        temp, vib, curr = result
+        cycle += 1
+        derived = derive_params(temp, vib, curr)
         reading = {
-            'timestamp': datetime.now().isoformat(), 'cycle': cycle,
-            'temperature_c': round(temp, 2),
-            'vibration_rms_mm_s2': round(vib, 2),
-            'spindle_current_a': round(curr, 2),
-            'tool_id': 'TB001', 'tool_material': 'Carbide', 'coating': 'TiN',
-            **derived
+            'timestamp':             datetime.now().isoformat(),
+            'cycle':                 cycle,
+            'temperature_c':         round(temp, 2),
+            'vibration_rms_mm_s2':   round(vib,  2),
+            'spindle_current_a':     round(curr,  2),
+            'tool_id':               'TB001',
+            'tool_material':         'Carbide',
+            'coating':               'TiN',
+            **derived,
         }
         await broadcast(reading)
-        log.info(f'#{cycle} T={temp:.1f}C V={vib:.2f} I={curr:.2f}A → {derived["tool_status"]}')
+        log.info(f'#{cycle} TEMP={temp:.1f}°C  VIB={vib:.2f}mm/s²  CURR={curr:.2f}A  → {derived["tool_status"]}')
+        await asyncio.sleep(READ_INTERVAL)
 
 
-async def http_health(request):
-    return web.Response(
-        text=json.dumps({'status': 'ok', 'clients': len(connected)}),
-        content_type='application/json',
-        headers={'Access-Control-Allow-Origin': '*'}
-    )
-
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    print('=' * 50)
-    print('  BROACHING SENSOR BRIDGE v2.0')
-    print('=' * 50)
-    tp = TEMP_PORT; vp = VIB_PORT; cp = CURRENT_PORT
-    if not any([tp, vp, cp]):
-        tp, vp, cp = auto_detect_ports()
-    t_s = SensorReader(tp, label='TEMP')    if tp else None
-    v_s = SensorReader(vp, label='VIB')     if vp else None
-    c_s = SensorReader(cp, label='CURRENT') if cp else None
-    if t_s: t_s.connect()
-    if v_s: v_s.connect()
-    if c_s: c_s.connect()
-    if AIOHTTP_OK:
-        app = web.Application()
-        app.router.add_get('/health', http_health)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, HOST, PORT).start()
-    await websockets.serve(ws_handler, HOST, PORT, path='/ws')
-    print(f'\nBridge live  →  ws://{HOST}:{PORT}/ws')
-    print(f'Health check →  http://{HOST}:{PORT}/health')
-    print('Open the app in Chrome/Edge — it auto-connects.\n')
-    await sensor_loop(t_s, v_s, c_s)
+    print('=' * 55)
+    print('  BROACHING SENSOR BRIDGE v3.0  (Single Arduino Port)')
+    print('=' * 55)
+
+    port = ARDUINO_PORT or auto_detect_port()
+    if not port:
+        log.error('No COM port found. Plug in your Arduino and try again.')
+        sys.exit(1)
+
+    print(f'  Arduino port : {port}')
+    print(f'  WebSocket    : ws://{HOST}:{WS_PORT}/ws')
+    print('  Waiting for browser to connect...')
+    print('=' * 55)
+
+    # Start WebSocket server
+    await websockets.serve(ws_handler, HOST, WS_PORT, path='/ws')
+    # Start serial loop
+    await serial_loop(port)
 
 
 if __name__ == '__main__':
