@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v3.0
+Broaching Machine Sensor Bridge v3.1
 ======================================
 Reads ALL 3 sensors through a SINGLE Arduino Uno COM port.
 Arduino sends one line per second:
   TEMP:25.30,VIB:0.45,CURR:2.10
 
-INSTALL:  pip install pyserial websockets
+- Streams live data to browser via WebSocket (ws://localhost:8765/ws)
+- Saves every reading permanently to cloud database
+
+INSTALL:  pip install pyserial websockets requests
 RUN:      python sensor_bridge.py
 """
 
-import asyncio, json, re, logging, sys
+import asyncio, json, re, logging, sys, threading
+import requests
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -19,12 +23,20 @@ log = logging.getLogger(__name__)
 HOST          = 'localhost'
 WS_PORT       = 8765
 BAUD_RATE     = 9600
-READ_INTERVAL = 0.1  # poll serial frequently
+READ_INTERVAL = 0.1
 
-# ── Set your Arduino COM port here ──────────────────────────────────────────
-# Leave as None to auto-detect the first available port
+# Cloud API endpoint — saves data permanently
+CLOUD_API_URL = 'https://machine-ed65069d.base44.app/functions/saveSensorReading'
+
+# Set your Arduino COM port here, or leave None to auto-detect
 ARDUINO_PORT = None   # e.g. 'COM3'
-# ────────────────────────────────────────────────────────────────────────────
+
+# Thresholds for alerts
+THRESHOLDS = {
+    'temperature_c':        {'warn': 82, 'error': 88},
+    'vibration_rms_mm_s2':  {'warn': 28, 'error': 33},
+    'spindle_current_a':    {'warn': 41, 'error': 44},
+}
 
 try:
     import serial
@@ -43,54 +55,39 @@ except ImportError:
 
 
 def auto_detect_port():
-    """Find the first available COM port (Arduino usually shows as USB Serial)."""
     ports = list(serial.tools.list_ports.comports())
     if not ports:
         return None
     for p in ports:
         log.info(f'Found port: {p.device} — {p.description}')
-    # Prefer a port with "Arduino" or "CH340" or "USB" in description
     for p in ports:
         desc = (p.description or '').lower()
         if any(x in desc for x in ['arduino', 'ch340', 'ch341', 'usb serial', 'usb-serial', 'uart']):
             log.info(f'Auto-selected: {p.device}')
             return p.device
-    # fallback: first port
     log.info(f'Auto-selected (fallback): {ports[0].device}')
     return ports[0].device
 
 
 def parse_line(line: str):
-    """
-    Parse a line from Arduino.
-    Expected format: TEMP:25.30,VIB:0.45,CURR:2.10
-    Returns (temp, vib, current) floats or None if parse fails.
-    """
     line = line.strip()
     if not line:
         return None
     try:
-        temp = vib = curr = None
-        # Try labeled format: TEMP:x,VIB:y,CURR:z
         t_m = re.search(r'TEMP[:\s]+([-\d.]+)', line, re.IGNORECASE)
         v_m = re.search(r'VIB[:\s]+([-\d.]+)',  line, re.IGNORECASE)
         c_m = re.search(r'CURR[:\s]+([-\d.]+)', line, re.IGNORECASE)
-        if t_m: temp = float(t_m.group(1))
-        if v_m: vib  = float(v_m.group(1))
-        if c_m: curr = float(c_m.group(1))
-        if temp is not None and vib is not None and curr is not None:
-            return temp, vib, curr
-        # Fallback: plain CSV "25.30,0.45,2.10"
+        if t_m and v_m and c_m:
+            return float(t_m.group(1)), float(v_m.group(1)), float(c_m.group(1))
         parts = [p.strip() for p in line.split(',')]
         if len(parts) >= 3:
             return float(parts[0]), float(parts[1]), float(parts[2])
     except Exception as e:
-        log.debug(f'Parse error on line "{line}": {e}')
+        log.debug(f'Parse error on "{line}": {e}')
     return None
 
 
 def derive_params(temp, vib, curr):
-    """Physics-based estimation of unmeasured parameters from the 3 sensor values."""
     force = max(2500, min(11500, curr * 240 + vib * 15 + (temp - 77) * 50))
     ae    = max(300,  min(650,   curr * 12 + vib * 2.5 + 200))
     wear  = min(1.5,  max(0,     (vib - 6) / 31 * 1.5))
@@ -110,7 +107,40 @@ def derive_params(temp, vib, curr):
     }
 
 
-# ── WebSocket server ─────────────────────────────────────────────────────────
+def check_alerts(reading):
+    alerts = []
+    for param, limits in THRESHOLDS.items():
+        val = reading.get(param)
+        if val is None:
+            continue
+        if val >= limits['error']:
+            alerts.append({'type': 'error', 'parameter': param, 'value': val, 'threshold': limits['error'],
+                           'message': f'{param} critically high: {val}'})
+        elif val >= limits['warn']:
+            alerts.append({'type': 'warning', 'parameter': param, 'value': val, 'threshold': limits['warn'],
+                           'message': f'{param} high: {val}'})
+    return alerts
+
+
+def save_to_cloud(reading, alerts):
+    """Save reading to cloud DB in a background thread (non-blocking)."""
+    def _post():
+        try:
+            resp = requests.post(
+                CLOUD_API_URL,
+                json={'reading': reading, 'alerts': alerts},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                log.debug(f'Cloud save OK — id={resp.json().get("id")}')
+            else:
+                log.warning(f'Cloud save failed: {resp.status_code} {resp.text}')
+        except Exception as e:
+            log.warning(f'Cloud save error: {e}')
+    threading.Thread(target=_post, daemon=True).start()
+
+
+# ── WebSocket server ────────────────────────────────────────────────────────
 connected_clients = set()
 
 async def ws_handler(websocket):
@@ -138,10 +168,9 @@ async def broadcast(payload: dict):
 
 # ── Serial reading loop ──────────────────────────────────────────────────────
 async def serial_loop(port: str):
-    ser = None
+    ser   = None
     cycle = 0
     while True:
-        # Try to (re)connect
         if ser is None or not ser.is_open:
             try:
                 ser = serial.Serial(port, BAUD_RATE, timeout=1)
@@ -150,7 +179,6 @@ async def serial_loop(port: str):
                 log.warning(f'Cannot open {port}: {e}  — retrying in 3s')
                 await asyncio.sleep(3)
                 continue
-        # Read one line
         try:
             raw = ser.readline().decode('utf-8', errors='ignore')
         except Exception as e:
@@ -158,33 +186,44 @@ async def serial_loop(port: str):
             ser = None
             await asyncio.sleep(1)
             continue
+
         result = parse_line(raw)
         if result is None:
             await asyncio.sleep(READ_INTERVAL)
             continue
+
         temp, vib, curr = result
         cycle += 1
         derived = derive_params(temp, vib, curr)
         reading = {
-            'timestamp':             datetime.now().isoformat(),
-            'cycle':                 cycle,
-            'temperature_c':         round(temp, 2),
-            'vibration_rms_mm_s2':   round(vib,  2),
-            'spindle_current_a':     round(curr,  2),
-            'tool_id':               'TB001',
-            'tool_material':         'Carbide',
-            'coating':               'TiN',
+            'timestamp':           datetime.now().isoformat(),
+            'cycle':               cycle,
+            'temperature_c':       round(temp, 2),
+            'vibration_rms_mm_s2': round(vib,  2),
+            'spindle_current_a':   round(curr,  2),
+            'tool_id':             'TB001',
+            'tool_material':       'Carbide',
+            'coating':             'TiN',
             **derived,
         }
+
+        alerts = check_alerts(reading)
+
+        # 1. Stream to browser (instant)
         await broadcast(reading)
-        log.info(f'#{cycle} TEMP={temp:.1f}°C  VIB={vib:.2f}mm/s²  CURR={curr:.2f}A  → {derived["tool_status"]}')
+
+        # 2. Save to cloud database (background, non-blocking)
+        save_to_cloud(reading, alerts)
+
+        log.info(f'#{cycle} TEMP={temp:.1f}°C  VIB={vib:.2f}  CURR={curr:.2f}A  → {derived["tool_status"]}  ☁ saved')
         await asyncio.sleep(READ_INTERVAL)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 async def main():
     print('=' * 55)
-    print('  BROACHING SENSOR BRIDGE v3.0  (Single Arduino Port)')
+    print('  BROACHING SENSOR BRIDGE v3.1')
+    print('  Live stream + Cloud database storage')
     print('=' * 55)
 
     port = ARDUINO_PORT or auto_detect_port()
@@ -194,12 +233,11 @@ async def main():
 
     print(f'  Arduino port : {port}')
     print(f'  WebSocket    : ws://{HOST}:{WS_PORT}/ws')
+    print(f'  Cloud DB     : {CLOUD_API_URL}')
     print('  Waiting for browser to connect...')
     print('=' * 55)
 
-    # Start WebSocket server
     await websockets.serve(ws_handler, HOST, WS_PORT, path='/ws')
-    # Start serial loop
     await serial_loop(port)
 
 
