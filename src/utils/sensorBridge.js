@@ -1,7 +1,14 @@
+/**
+ * sensorBridge.js
+ * WebSocket client that connects to the local sensor_bridge.py script.
+ * The bridge runs on the same PC as the Arduino and serves data on
+ * ws://localhost:8765/ws
+ */
+
 const WS_URL = 'ws://localhost:8765/ws';
-let ws = null;
-let reconnectTimer = null;
-let listeners = [];
+let ws               = null;
+let reconnectTimer   = null;
+let listeners        = [];
 let connectionStatus = 'disconnected';
 
 export function getBridgeStatus() { return connectionStatus; }
@@ -12,7 +19,7 @@ export function onReading(callback) {
 }
 
 function notifyListeners(data) {
-  listeners.forEach(l => { try { l(data); } catch(e) {} });
+  listeners.forEach(l => { try { l(data); } catch (e) { /* ignore */ } });
 }
 
 export function connectBridge() {
@@ -26,7 +33,7 @@ export function connectBridge() {
       notifyListeners({ type: 'status', status: 'connected' });
     };
     ws.onmessage = (event) => {
-      try { notifyListeners({ type: 'reading', data: JSON.parse(event.data) }); } catch(e) {}
+      try { notifyListeners({ type: 'reading', data: JSON.parse(event.data) }); } catch (e) { /* ignore */ }
     };
     ws.onclose = () => {
       connectionStatus = 'disconnected';
@@ -37,7 +44,7 @@ export function connectBridge() {
       connectionStatus = 'error';
       notifyListeners({ type: 'status', status: 'error' });
     };
-  } catch(e) {
+  } catch (e) {
     connectionStatus = 'error';
     reconnectTimer = setTimeout(connectBridge, 5000);
   }

@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { getSettings, saveSettings } from '../utils/storage';
 import { beep, alarmBeep } from '../utils/alerts';
-import { Save, Volume2, VolumeX, Key } from 'lucide-react';
+import { Save, Volume2, VolumeX, Cloud } from 'lucide-react';
 
 export default function SettingsPage() {
-  const [s, setS] = useState(getSettings());
+  const [s, setS]     = useState(getSettings());
   const [saved, setSaved] = useState(false);
   const update = (key, val) => setS(prev => ({ ...prev, [key]: val }));
 
@@ -37,8 +37,10 @@ export default function SettingsPage() {
     <div className="p-6 space-y-6 max-w-2xl">
       <div>
         <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Settings</h1>
-        <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">Thresholds · Alerts · AI</div>
+        <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">Thresholds · Alerts · Sync</div>
       </div>
+
+      {/* Thresholds */}
       <div className="bg-[#181c22] rounded-xl p-5 space-y-6">
         <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Alert Thresholds</div>
         <SliderRow label="Temperature"   stateKey="tempLimit"    min={60}   max={100}  unit="°C"/>
@@ -46,17 +48,22 @@ export default function SettingsPage() {
         <SliderRow label="Current"       stateKey="currentLimit" min={30}   max={50}   unit="A"/>
         <SliderRow label="Cutting Force" stateKey="forceLimit"   min={8000} max={12000} step={100} unit="N"/>
       </div>
+
+      {/* Alarm sounds */}
       <div className="bg-[#181c22] rounded-xl p-5 space-y-4">
         <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Alarm Sounds</div>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            {s.beepEnabled ? <Volume2 size={16} className="text-[#00daf3]"/> : <VolumeX size={16} className="text-[#849396]"/>}
+            {s.beepEnabled
+              ? <Volume2 size={16} className="text-[#00daf3]"/>
+              : <VolumeX size={16} className="text-[#849396]"/>}
             <span className="text-sm text-[#dfe2eb]">Beep on high alerts</span>
           </div>
           <button onClick={() => update('beepEnabled', !s.beepEnabled)}
             className="relative w-12 h-6 rounded-full transition-all"
             style={{ background: s.beepEnabled ? '#00daf3' : '#31353c' }}>
-            <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all duration-200 ${s.beepEnabled ? 'left-[26px]' : 'left-0.5'}`}/>
+            <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all duration-200 ${
+              s.beepEnabled ? 'left-[26px]' : 'left-0.5'}`}/>
           </button>
         </div>
         <button onClick={alarmBeep}
@@ -64,21 +71,37 @@ export default function SettingsPage() {
           🔊 Test alarm sound
         </button>
       </div>
+
+      {/* Cross-device sync */}
       <div className="bg-[#181c22] rounded-xl p-5 space-y-4">
         <div className="flex items-center gap-2">
-          <Key size={13} className="text-[#ffba38]"/>
-          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">AI API Key (Optional)</span>
+          <Cloud size={13} className="text-[#ffba38]"/>
+          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Cross-Device Sync (Optional)</span>
         </div>
         <p className="text-xs text-[#849396] leading-relaxed">
-          Set <code className="text-[#00daf3] bg-[#1c2026] px-1 rounded">AI_API_KEY=sk-…</code> when running sensor_bridge.py for AI-powered estimation. Without it, physics math is used — still accurate.
+          To view data on another laptop, create a free bin at{' '}
+          <a href="https://jsonbin.io" target="_blank" rel="noreferrer" className="text-[#00daf3]">jsonbin.io</a>
+          {' '}and paste the Bin ID below. Readings sync every 60 seconds.
         </p>
-        <input type="password" value={s.aiApiKey || ''} onChange={e => update('aiApiKey', e.target.value)}
-          placeholder="sk-…"
-          className="w-full bg-[#1c2026] border border-[#3b494c]/30 text-[#dfe2eb] text-xs rounded-xl px-3 py-2.5 outline-none focus:border-[#00daf3]/40 placeholder-[#3b494c]"/>
+        <div className="space-y-2">
+          <label className="text-[10px] uppercase tracking-[0.15em] text-[#849396]">Bin ID</label>
+          <input type="text" value={s.syncBinId || ''} onChange={e => update('syncBinId', e.target.value)}
+            placeholder="e.g. 64a1b2c3d4e5f6..."
+            className="w-full bg-[#1c2026] border border-[#3b494c]/30 text-[#dfe2eb] text-xs rounded-xl px-3 py-2.5 outline-none focus:border-[#00daf3]/40 placeholder-[#3b494c]"/>
+        </div>
+        <div className="space-y-2">
+          <label className="text-[10px] uppercase tracking-[0.15em] text-[#849396]">API Key (for private bins)</label>
+          <input type="password" value={s.syncApiKey || ''} onChange={e => update('syncApiKey', e.target.value)}
+            placeholder="$2b$..."
+            className="w-full bg-[#1c2026] border border-[#3b494c]/30 text-[#dfe2eb] text-xs rounded-xl px-3 py-2.5 outline-none focus:border-[#00daf3]/40 placeholder-[#3b494c]"/>
+        </div>
       </div>
+
       <button onClick={handleSave}
         className={`flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-bold transition-all ${
-          saved ? 'bg-[#00daf3]/20 text-[#00daf3] border border-[#00daf3]/20' : 'bg-gradient-to-r from-[#c3f5ff] to-[#00e5ff] text-[#001f24] hover:opacity-90'}`}>
+          saved
+            ? 'bg-[#00daf3]/20 text-[#00daf3] border border-[#00daf3]/20'
+            : 'bg-gradient-to-r from-[#c3f5ff] to-[#00e5ff] text-[#001f24] hover:opacity-90'}` }>
         <Save size={14}/>
         {saved ? '✓ Saved!' : 'Save Settings'}
       </button>

@@ -1,26 +1,30 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { connectBridge, onReading, disconnectBridge } from '../utils/sensorBridge';
-import { saveReading, getSettings, saveAlert } from '../utils/storage';
+import { saveReading, getSettings, saveAlert, getReadings } from '../utils/storage';
 import { checkThresholds, alarmBeep } from '../utils/alerts';
+import { pushToCloud } from '../utils/cloudSync';
 
 /**
- * useSensorData — LIVE ONLY, zero demo/mock data.
- * Shows "Waiting for sensors..." until the Arduino bridge connects.
+ * useSensorData
+ * Connects to the Arduino bridge, processes every incoming reading,
+ * saves to localStorage, and optionally syncs to a shared cloud bin.
+ * Zero mock or demo data — shows waiting state until sensors connect.
  */
 export function useSensorData() {
   const [bridgeStatus, setBridgeStatus] = useState('disconnected');
-  const [latest, setLatest]             = useState(null);
-  const [chartData, setChartData]       = useState([]);
+  const [latest,       setLatest]       = useState(null);
+  const [chartData,    setChartData]    = useState([]);
   const [activeAlerts, setActiveAlerts] = useState([]);
-  const [isFlashing, setIsFlashing]     = useState(false);
+  const [isFlashing,   setIsFlashing]   = useState(false);
+  const syncTimer = useRef(null);
 
   const processReading = useCallback((reading) => {
     const settings = getSettings();
 
-    // Persist to localStorage (real data only)
+    // 1. Save to localStorage
     saveReading(reading);
 
-    // Threshold checks
+    // 2. Threshold checks & alerts
     const thresh = checkThresholds(reading, settings);
     if (thresh.length > 0) {
       thresh.forEach(a => saveAlert({ ...a, reading }));
@@ -33,11 +37,24 @@ export function useSensorData() {
       setActiveAlerts(prev => [...thresh, ...prev].slice(0, 50));
     }
 
+    // 3. Update UI
     setLatest(reading);
     const time = new Date(reading.timestamp).toLocaleTimeString('en', {
       hour: '2-digit', minute: '2-digit', second: '2-digit',
     });
     setChartData(prev => [...prev, { ...reading, time }].slice(-60));
+  }, []);
+
+  // Optional cloud sync every 60 seconds
+  useEffect(() => {
+    syncTimer.current = setInterval(() => {
+      const settings = getSettings();
+      if (settings.syncBinId) {
+        const readings = getReadings();
+        pushToCloud(readings, settings.syncBinId, settings.syncApiKey);
+      }
+    }, 60000);
+    return () => clearInterval(syncTimer.current);
   }, []);
 
   useEffect(() => {
@@ -48,22 +65,12 @@ export function useSensorData() {
         processReading(msg.data);
       }
     });
-
-    // Try to connect to Arduino bridge immediately and keep retrying
     connectBridge();
-
     return () => {
       unsub();
       disconnectBridge();
     };
   }, []);
 
-  return {
-    bridgeStatus,
-    latest,
-    chartData,
-    activeAlerts,
-    isFlashing,
-    connect: connectBridge,
-  };
+  return { bridgeStatus, latest, chartData, activeAlerts, isFlashing, connect: connectBridge };
 }
