@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v3.2
+Broaching Machine Sensor Bridge v3.3
 Reads Arduino via single COM port, streams to browser via WebSocket.
 INSTALL: pip install pyserial websockets requests
 RUN:     python sensor_bridge.py
@@ -17,7 +17,7 @@ WS_PORT  = 8765
 BAUD     = 9600
 
 # Set your Arduino port here — check Arduino IDE > Tools > Port
-ARDUINO_PORT = 'COM4'   # <-- change this if needed
+ARDUINO_PORT = 'COM7'   # <-- change this if needed
 
 THRESHOLDS = {
     'temperature_c':       {'warn': 82, 'error': 88},
@@ -81,9 +81,18 @@ async def ws_handler(websocket):
     connected.add(websocket)
     log.info(f'Browser connected — {len(connected)} client(s)')
     try:
-        await websocket.wait_closed()
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                if data.get('type') == 'ping':
+                    await websocket.send(json.dumps({'type': 'pong'}))
+            except Exception:
+                pass
+    except Exception:
+        pass
     finally:
         connected.discard(websocket)
+        log.info(f'Browser disconnected — {len(connected)} client(s)')
 
 
 async def broadcast(data):
@@ -142,7 +151,7 @@ async def serial_loop(port):
 
 async def main():
     print('=' * 50)
-    print('  BROACHING SENSOR BRIDGE')
+    print('  BROACHING SENSOR BRIDGE v3.3')
     print(f'  Arduino : {ARDUINO_PORT}')
     print(f'  WebSocket: ws://{HOST}:{WS_PORT}/ws')
     print('=' * 50)
