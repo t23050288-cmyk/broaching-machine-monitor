@@ -1,14 +1,12 @@
 /**
- * sensorBridge.js
- * WebSocket client that connects to the local sensor_bridge.py script.
- * The bridge runs on the same PC as the Arduino and serves data on
+ * sensorBridge.js  v4.0
+ * WebSocket client — connects to local sensor_bridge.py
  * ws://localhost:8765/ws
  */
 
 const WS_URL = 'ws://localhost:8765/ws';
 let ws               = null;
 let reconnectTimer   = null;
-let pingTimer        = null;
 let listeners        = [];
 let connectionStatus = 'disconnected';
 
@@ -23,58 +21,57 @@ function notifyListeners(data) {
   listeners.forEach(l => { try { l(data); } catch (e) { /* ignore */ } });
 }
 
-function startPing() {
-  stopPing();
-  pingTimer = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(JSON.stringify({ type: 'ping' })); } catch (e) { /* ignore */ }
-    }
-  }, 5000);
-}
-
-function stopPing() {
-  if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+function setStatus(status) {
+  connectionStatus = status;
+  notifyListeners({ type: 'status', status });
 }
 
 export function connectBridge() {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
-  connectionStatus = 'connecting';
-  notifyListeners({ type: 'status', status: 'connecting' });
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+  setStatus('connecting');
+
   try {
     ws = new WebSocket(WS_URL);
+
     ws.onopen = () => {
-      connectionStatus = 'connected';
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      notifyListeners({ type: 'status', status: 'connected' });
-      startPing();
+      setStatus('connected');
     };
+
     ws.onmessage = (event) => {
       try {
         const parsed = JSON.parse(event.data);
-        if (parsed.type === 'pong') return; // ignore pong
+        if (parsed.type === 'pong') return;
         notifyListeners({ type: 'reading', data: parsed });
       } catch (e) { /* ignore */ }
     };
-    ws.onclose = () => {
-      connectionStatus = 'disconnected';
-      stopPing();
-      notifyListeners({ type: 'status', status: 'disconnected' });
-      reconnectTimer = setTimeout(connectBridge, 3000);
+
+    ws.onclose = (e) => {
+      ws = null;
+      setStatus('disconnected');
+      // reconnect after 2 seconds
+      reconnectTimer = setTimeout(connectBridge, 2000);
     };
+
     ws.onerror = () => {
-      connectionStatus = 'error';
-      stopPing();
-      notifyListeners({ type: 'status', status: 'error' });
+      // onclose will fire after onerror, so just log
+      setStatus('error');
     };
+
   } catch (e) {
-    connectionStatus = 'error';
-    reconnectTimer = setTimeout(connectBridge, 5000);
+    ws = null;
+    setStatus('error');
+    reconnectTimer = setTimeout(connectBridge, 3000);
   }
 }
 
 export function disconnectBridge() {
-  stopPing();
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (ws) { ws.close(); ws = null; }
-  connectionStatus = 'disconnected';
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) {
+    ws.onclose = null; // prevent auto-reconnect
+    ws.close();
+    ws = null;
+  }
+  setStatus('disconnected');
 }
