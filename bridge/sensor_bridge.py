@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v3.3
+Broaching Machine Sensor Bridge v4.0
 Reads Arduino via single COM port, streams to browser via WebSocket.
 INSTALL: pip install pyserial websockets requests
 RUN:     python sensor_bridge.py
 """
 
-import asyncio, json, re, logging, sys, threading
+import asyncio, json, re, logging, sys
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-HOST     = 'localhost'
-WS_PORT  = 8765
-BAUD     = 9600
-
-# Set your Arduino port here — check Arduino IDE > Tools > Port
-ARDUINO_PORT = 'COM7'   # <-- change this if needed
+HOST         = '0.0.0.0'
+WS_PORT      = 8765
+BAUD         = 9600
+ARDUINO_PORT = 'COM7'
 
 THRESHOLDS = {
     'temperature_c':       {'warn': 82, 'error': 88},
@@ -27,7 +25,6 @@ THRESHOLDS = {
 
 try:
     import serial
-    import serial.tools.list_ports
 except ImportError:
     log.error('pyserial not installed. Run: pip install pyserial'); sys.exit(1)
 
@@ -76,10 +73,19 @@ def derive(temp, vib, curr):
 
 
 connected = set()
+latest_reading = None
+
 
 async def ws_handler(websocket):
+    global latest_reading
     connected.add(websocket)
     log.info(f'Browser connected — {len(connected)} client(s)')
+    # immediately send last known reading so UI populates instantly
+    if latest_reading:
+        try:
+            await websocket.send(json.dumps(latest_reading))
+        except Exception:
+            pass
     try:
         async for message in websocket:
             try:
@@ -100,12 +106,15 @@ async def broadcast(data):
     msg  = json.dumps(data)
     dead = set()
     for c in list(connected):
-        try:    await c.send(msg)
-        except: dead.add(c)
+        try:
+            await c.send(msg)
+        except Exception:
+            dead.add(c)
     connected.difference_update(dead)
 
 
 async def serial_loop(port):
+    global latest_reading
     ser   = None
     cycle = 0
     while True:
@@ -121,13 +130,15 @@ async def serial_loop(port):
             raw = ser.readline().decode('utf-8', errors='ignore')
         except Exception as e:
             log.warning(f'Read error: {e}')
+            try: ser.close()
+            except: pass
             ser = None
             await asyncio.sleep(1)
             continue
 
         result = parse_line(raw)
         if result is None:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
             continue
 
         temp, vib, curr = result
@@ -144,18 +155,26 @@ async def serial_loop(port):
             'coating':             'TiN',
             **derived,
         }
+        latest_reading = reading
         await broadcast(reading)
         log.info(f'#{cycle} TEMP={temp:.1f}C VIB={vib:.2f} CURR={curr:.2f}A -> {derived["tool_status"]}')
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
 
 async def main():
     print('=' * 50)
-    print('  BROACHING SENSOR BRIDGE v3.3')
+    print('  BROACHING SENSOR BRIDGE v4.0')
     print(f'  Arduino : {ARDUINO_PORT}')
-    print(f'  WebSocket: ws://{HOST}:{WS_PORT}/ws')
+    print(f'  WebSocket: ws://localhost:{WS_PORT}/ws')
     print('=' * 50)
-    async with ws_serve(ws_handler, HOST, WS_PORT):
+    async with ws_serve(
+        ws_handler,
+        HOST,
+        WS_PORT,
+        ping_interval=10,
+        ping_timeout=30,
+        close_timeout=10,
+    ):
         await serial_loop(ARDUINO_PORT)
 
 
