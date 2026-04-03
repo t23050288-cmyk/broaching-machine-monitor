@@ -6,6 +6,7 @@ import Inventory from './pages/Inventory';
 import AlertsPage from './pages/Alerts';
 import Records from './pages/Records';
 import SettingsPage from './pages/Settings';
+import AiPredictor from './pages/AiPredictor';
 
 export default function App() {
   const [page, setPage] = useState('dashboard');
@@ -18,6 +19,7 @@ export default function App() {
       case 'alerts':      return <AlertsPage />;
       case 'records':     return <Records />;
       case 'settings':    return <SettingsPage />;
+      case 'predictor':   return <AiPredictor />;
       default:            return <Dashboard />;
     }
   };
