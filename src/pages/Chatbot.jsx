@@ -1,25 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
 import { onReading, connectBridge } from '../utils/sensorBridge';
-import { MessageCircle, Send, RefreshCw, Bot, User, Cpu, Trash2 } from 'lucide-react';
+import { MessageCircle, Send, RefreshCw, Bot, User, Trash2 } from 'lucide-react';
 
-const NVIDIA_KEY = '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';
-const NVIDIA_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const AI_MODEL   = 'meta/llama-3.1-8b-instruct';
+// Backend proxy — no CORS issues
+const AI_ENDPOINT = 'https://api.base44.com/api/apps/69c94fa77c9af5dded65069d/functions/askAI';
 
 const CHAT_KEY = 'bmm_chat_history';
-
-const SYSTEM_PROMPT = `You are KineticAI, an expert assistant for broaching machine monitoring and tool life management.
-You have deep knowledge of:
-- Broaching machine operations, maintenance, and troubleshooting
-- Tool wear, tool life prediction, and replacement schedules
-- Sensor data interpretation (temperature, vibration, current)
-- Cutting parameters optimization (speed, feed rate, depth of cut)
-- Coolant systems, coatings (TiN, TiCN, TiAlN), tool materials (Carbide, HSS)
-- Safety protocols and best practices
-- Reading and interpreting machine health data
-
-Be concise, practical, and helpful. If asked about live sensor data, remind the user to check the Dashboard or AI Predictor panel for real-time values.
-Always give actionable answers. Use simple language — the user may be a student or technician.`;
 
 function loadHistory() {
   try { return JSON.parse(localStorage.getItem(CHAT_KEY) || '[]'); }
@@ -70,39 +56,34 @@ export default function Chatbot() {
     setLoading(true);
 
     try {
-      // Build context with live sensor data if available
+      // Build sensor context string if live data available
       let sensorContext = '';
       if (liveData) {
-        sensorContext = `\n\nCurrent live sensor readings from the machine:\n- Temperature: ${liveData.temperature_c?.toFixed(2)}°C\n- Vibration: ${liveData.vibration_rms_mm_s2?.toFixed(3)} m/s²\n- Current: ${liveData.spindle_current_a?.toFixed(3)} A\n- Tool Status: ${liveData.tool_status}\n- Wear Progression: ${liveData.wear_progression?.toFixed(3)}`;
+        sensorContext = `Temperature: ${liveData.temperature_c?.toFixed(2)}°C, Vibration: ${liveData.vibration_rms_mm_s2?.toFixed(3)} m/s², Current: ${liveData.spindle_current_a?.toFixed(3)} A, Tool Status: ${liveData.tool_status}, Wear: ${liveData.wear_progression?.toFixed(3)}`;
       }
 
       const history = updated.slice(-10).map(m => ({ role: m.role, content: m.content }));
 
-      const res = await fetch(NVIDIA_URL, {
+      const res = await fetch(AI_ENDPOINT, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${NVIDIA_KEY}` },
-        body: JSON.stringify({
-          model: AI_MODEL,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT + sensorContext },
-            ...history,
-          ],
-          temperature: 0.4,
-          max_tokens: 500,
-          stream: false,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history, sensorContext }),
       });
 
-      if (!res.ok) throw new Error(`API error ${res.status}`);
       const data = await res.json();
-      const reply = data.choices[0].message.content.trim();
+      if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
 
-      const aiMsg = { role: 'assistant', content: reply, ts: Date.now() };
+      const aiMsg = { role: 'assistant', content: data.reply, ts: Date.now() };
       const final = [...updated, aiMsg];
       setMessages(final);
       saveHistory(final);
     } catch (e) {
-      const errMsg = { role: 'assistant', content: `Sorry, I couldn't connect to AI right now. Error: ${e.message}. Check your internet connection.`, ts: Date.now(), error: true };
+      const errMsg = {
+        role: 'assistant',
+        content: `Sorry, something went wrong: ${e.message}`,
+        ts: Date.now(),
+        error: true,
+      };
       const final = [...updated, errMsg];
       setMessages(final);
       saveHistory(final);
