@@ -8,21 +8,23 @@ import Records from './pages/Records';
 import SettingsPage from './pages/Settings';
 import AiPredictor from './pages/AiPredictor';
 import Chatbot from './pages/Chatbot';
+import SensorReadings from './pages/SensorReadings';
 
 export default function App() {
   const [page, setPage] = useState('dashboard');
 
   const renderPage = () => {
     switch (page) {
-      case 'dashboard':   return <Dashboard />;
-      case 'performance': return <Performance />;
-      case 'inventory':   return <Inventory />;
-      case 'alerts':      return <AlertsPage />;
-      case 'records':     return <Records />;
-      case 'settings':    return <SettingsPage />;
-      case 'predictor':   return <AiPredictor />;
-      case 'chatbot':     return <Chatbot />;
-      default:            return <Dashboard />;
+      case 'dashboard':  return <Dashboard />;
+      case 'performance':return <Performance />;
+      case 'inventory':  return <Inventory />;
+      case 'alerts':     return <AlertsPage />;
+      case 'records':    return <Records />;
+      case 'settings':   return <SettingsPage />;
+      case 'predictor':  return <AiPredictor />;
+      case 'chatbot':    return <Chatbot />;
+      case 'readings':   return <SensorReadings />;
+      default:           return <Dashboard />;
     }
   };
 

@@ -1,15 +1,16 @@
 import { useState } from 'react';
-import { Activity, BarChart2, AlertTriangle, Settings, Package, Database, ChevronLeft, ChevronRight, Brain, MessageCircle } from 'lucide-react';
+import { Activity, BarChart2, AlertTriangle, Settings, Package, Database, ChevronLeft, ChevronRight, Brain, MessageCircle, Table } from 'lucide-react';
 
 const navItems = [
-  { icon: Activity,       label: 'Health Pulse',   path: 'dashboard' },
-  { icon: BarChart2,      label: 'Performance',    path: 'performance' },
-  { icon: Package,        label: 'Tool Inventory', path: 'inventory' },
-  { icon: AlertTriangle,  label: 'Alert Center',   path: 'alerts' },
-  { icon: Database,       label: 'Data Records',   path: 'records' },
-  { icon: Brain,          label: 'AI Predictor',   path: 'predictor' },
-  { icon: MessageCircle,  label: 'AI Chatbot',     path: 'chatbot' },
-  { icon: Settings,       label: 'Settings',       path: 'settings' },
+  { icon: Activity,       label: 'Health Pulse',    path: 'dashboard' },
+  { icon: BarChart2,      label: 'Performance',     path: 'performance' },
+  { icon: Package,        label: 'Tool Inventory',  path: 'inventory' },
+  { icon: AlertTriangle,  label: 'Alert Center',    path: 'alerts' },
+  { icon: Database,       label: 'Data Records',    path: 'records' },
+  { icon: Table,          label: 'Sensor Readings', path: 'readings' },
+  { icon: Brain,          label: 'AI Predictor',    path: 'predictor' },
+  { icon: MessageCircle,  label: 'AI Chatbot',      path: 'chatbot' },
+  { icon: Settings,       label: 'Settings',        path: 'settings' },
 ];
 
 const AI_PATHS = ['predictor', 'chatbot'];
