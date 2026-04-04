@@ -1,15 +1,18 @@
 import { useState } from 'react';
-import { Activity, BarChart2, AlertTriangle, Settings, Package, Database, ChevronLeft, ChevronRight, Brain } from 'lucide-react';
+import { Activity, BarChart2, AlertTriangle, Settings, Package, Database, ChevronLeft, ChevronRight, Brain, MessageCircle } from 'lucide-react';
 
 const navItems = [
-  { icon: Activity,      label: 'Health Pulse',    path: 'dashboard' },
-  { icon: BarChart2,     label: 'Performance',     path: 'performance' },
-  { icon: Package,       label: 'Tool Inventory',  path: 'inventory' },
-  { icon: AlertTriangle, label: 'Alert Center',    path: 'alerts' },
-  { icon: Database,      label: 'Data Records',    path: 'records' },
-  { icon: Brain,         label: 'AI Predictor',    path: 'predictor' },
-  { icon: Settings,      label: 'Settings',        path: 'settings' },
+  { icon: Activity,       label: 'Health Pulse',   path: 'dashboard' },
+  { icon: BarChart2,      label: 'Performance',    path: 'performance' },
+  { icon: Package,        label: 'Tool Inventory', path: 'inventory' },
+  { icon: AlertTriangle,  label: 'Alert Center',   path: 'alerts' },
+  { icon: Database,       label: 'Data Records',   path: 'records' },
+  { icon: Brain,          label: 'AI Predictor',   path: 'predictor' },
+  { icon: MessageCircle,  label: 'AI Chatbot',     path: 'chatbot' },
+  { icon: Settings,       label: 'Settings',       path: 'settings' },
 ];
+
+const AI_PATHS = ['predictor', 'chatbot'];
 
 export default function Sidebar({ current, onChange }) {
   const [collapsed, setCollapsed] = useState(false);
@@ -27,25 +30,26 @@ export default function Sidebar({ current, onChange }) {
         </button>
       </div>
       <nav className="flex-1 px-2 space-y-0.5">
-        {navItems.map(({ icon: Icon, label, path }) => (
-          <button key={path} onClick={() => onChange(path)}
-            className={`w-full flex items-center gap-3 px-3 py-3 text-sm font-medium transition-all duration-150 rounded-lg
-              ${
-                path === 'predictor' && current === path
-                  ? 'bg-[#c084fc]/10 border-l-2 border-[#c084fc] text-[#c084fc]'
-                  : path === 'predictor'
-                    ? 'text-[#849396] hover:bg-[#c084fc]/5 hover:text-[#c084fc]'
-                    : current === path
-                      ? 'bg-[#1c2026] border-l-2 border-[#00e5ff] text-[#c3f5ff]'
-                      : 'text-[#849396] hover:bg-[#1c2026] hover:text-[#dfe2eb]'
-              }`}>
-            <Icon size={18} className="flex-shrink-0"/>
-            {!collapsed && <span className="font-body truncate">{label}</span>}
-            {!collapsed && path === 'predictor' && (
-              <span className="ml-auto text-[8px] bg-[#c084fc]/20 text-[#c084fc] px-1.5 py-0.5 rounded-full font-bold">AI</span>
-            )}
-          </button>
-        ))}
+        {navItems.map(({ icon: Icon, label, path }) => {
+          const isAI     = AI_PATHS.includes(path);
+          const isActive = current === path;
+          return (
+            <button key={path} onClick={() => onChange(path)}
+              className={`w-full flex items-center gap-3 px-3 py-3 text-sm font-medium transition-all duration-150 rounded-lg
+                ${
+                  isActive && isAI  ? 'bg-[#c084fc]/10 border-l-2 border-[#c084fc] text-[#c084fc]' :
+                  isActive          ? 'bg-[#1c2026] border-l-2 border-[#00e5ff] text-[#c3f5ff]' :
+                  isAI              ? 'text-[#849396] hover:bg-[#c084fc]/5 hover:text-[#c084fc]' :
+                                      'text-[#849396] hover:bg-[#1c2026] hover:text-[#dfe2eb]'
+                }`}>
+              <Icon size={18} className="flex-shrink-0"/>
+              {!collapsed && <span className="font-body truncate">{label}</span>}
+              {!collapsed && isAI && (
+                <span className="ml-auto text-[8px] bg-[#c084fc]/20 text-[#c084fc] px-1.5 py-0.5 rounded-full font-bold">AI</span>
+              )}
+            </button>
+          );
+        })}
       </nav>
       {!collapsed && (
         <div className="px-4 mt-4">
