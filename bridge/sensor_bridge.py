@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v4.0
-Reads Arduino via COM port, uses AI to predict derived parameters,
-streams everything to browser via WebSocket.
+Broaching Machine Sensor Bridge v5.0
+- Reads Arduino via COM port
+- Streams live sensor data to browser via WebSocket
+- Handles AI chat messages from browser (no CORS issues)
+- Generates daily reports via NVIDIA AI
 
-INSTALL: pip install pyserial websockets requests openai
+INSTALL: pip install pyserial websockets openai
 RUN:     python sensor_bridge.py
 """
 
-import asyncio, json, re, logging, sys, os
-from datetime import datetime, timedelta
+import asyncio, json, re, logging, sys, threading
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -19,10 +21,19 @@ WS_PORT      = 8765
 Baud         = 9600
 ARDUINO_PORT = 'COM4'   # <-- change if needed
 
-# ── NVIDIA / OpenAI API for predictions ─────────────────────────────────────
-NVIDIA_API_KEY = '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'
+NVIDIA_API_KEY  = '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'
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
-AI_MODEL = 'meta/llama-3.1-8b-instruct'
+AI_MODEL        = 'meta/llama-3.1-8b-instruct'
+
+CHAT_SYSTEM = """You are KineticAI, an expert assistant for broaching machine monitoring and tool life management.
+You have deep knowledge of:
+- Broaching machine operations, maintenance, and troubleshooting
+- Tool wear, tool life prediction, and replacement schedules
+- Sensor data interpretation (temperature, vibration, current)
+- Cutting parameters optimization (speed, feed rate, depth of cut)
+- Coolant systems, coatings (TiN, TiCN, TiAlN), tool materials (Carbide, HSS)
+- Safety protocols and best practices
+Be concise, practical, and helpful. Use simple language."""
 
 try:
     import serial
@@ -38,16 +49,18 @@ try:
     from openai import OpenAI
     ai_client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
     AI_AVAILABLE = True
-    log.info('AI predictions enabled via NVIDIA API')
+    log.info('AI enabled via NVIDIA API')
 except ImportError:
     AI_AVAILABLE = False
-    log.warning('openai not installed — using physics math. Run: pip install openai')
+    log.warning('openai not installed. Run: pip install openai')
 
-# ── History for daily report ──────────────────────────────────────────────────
+# ── Shared state ────────────────────────────────────────────────────────────
+connected    = set()
+latest_data  = None
 reading_history = []
 last_report_date = None
 
-# ── Physics-based fallback (when AI unavailable) ──────────────────────────────
+# ── Physics fallback ────────────────────────────────────────────────────────
 def physics_derive(temp, vib, curr):
     force  = max(2500, min(11500, curr*240 + vib*15 + (temp-25)*50))
     ae     = max(300,  min(650,   curr*12  + vib*2.5 + 200))
@@ -67,7 +80,6 @@ def physics_derive(temp, vib, curr):
         'prediction_source':    'physics',
     }
 
-# ── AI prediction ─────────────────────────────────────────────────────────────
 def ai_derive(temp, vib, curr):
     if not AI_AVAILABLE:
         return physics_derive(temp, vib, curr)
@@ -77,37 +89,42 @@ Given these live sensor readings:
 - Temperature: {temp:.2f} C
 - Vibration RMS: {vib:.3f} m/s2
 - Spindle Current: {curr:.3f} A
-
 Predict these parameters for a carbide broaching tool (respond ONLY with valid JSON, no explanation):
-{{
-  "cutting_force_n": <number 2500-11500>,
-  "acoustic_emission_db": <number 300-650>,
-  "surface_finish_ra_um": <number 0.2-2.0>,
-  "wear_progression": <number 0.0-1.5>,
-  "tool_status": <"new" or "worn" or "failed">,
-  "spindle_speed_mmin": <number 10-30>,
-  "feed_rate_mmtooth": <number 0.04-0.12>,
-  "coolant_flow_lmin": <number 15-25>
-}}"""
+{{"cutting_force_n":<2500-11500>,"acoustic_emission_db":<300-650>,"surface_finish_ra_um":<0.2-2.0>,"wear_progression":<0.0-1.5>,"tool_status":"new" or "worn" or "failed","spindle_speed_mmin":<10-30>,"feed_rate_mmtooth":<0.04-0.12>,"coolant_flow_lmin":<15-25>}}"""
         resp = ai_client.chat.completions.create(
             model=AI_MODEL,
             messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.1,
-            max_tokens=300,
-            stream=False
+            temperature=0.1, max_tokens=300, stream=False
         )
         text = resp.choices[0].message.content.strip()
-        # Extract JSON from response
         m = re.search(r'\{[^{}]+\}', text, re.DOTALL)
         if m:
             result = json.loads(m.group())
             result['prediction_source'] = 'ai'
             return result
     except Exception as e:
-        log.warning(f'AI prediction failed: {e} — using physics fallback')
+        log.warning(f'AI derive failed: {e}')
     return physics_derive(temp, vib, curr)
 
-# ── Daily AI report ───────────────────────────────────────────────────────────
+def ai_chat(messages, sensor_context=''):
+    """Handle a chat message from the browser."""
+    if not AI_AVAILABLE:
+        return 'AI not available. Run: pip install openai'
+    try:
+        system = CHAT_SYSTEM
+        if sensor_context:
+            system += f'\n\nCurrent live sensor readings:\n{sensor_context}'
+        all_msgs = [{'role': 'system', 'content': system}] + messages
+        resp = ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=all_msgs,
+            temperature=0.4, max_tokens=500, stream=False
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.warning(f'AI chat failed: {e}')
+        return f'AI error: {e}'
+
 def generate_daily_report(history):
     if not AI_AVAILABLE or not history:
         return None
@@ -116,35 +133,23 @@ def generate_daily_report(history):
         vibs   = [r['vibration_rms_mm_s2'] for r in history]
         currs  = [r['spindle_current_a']   for r in history]
         wears  = [r.get('wear_progression', 0) for r in history]
-        statuses = [r.get('tool_status', 'new') for r in history]
-        prompt = f"""You are a broaching machine health expert. Generate a daily report based on today's sensor data.
-
-Today's statistics ({len(history)} readings):
-- Temperature: avg={sum(temps)/len(temps):.1f}C, max={max(temps):.1f}C, min={min(temps):.1f}C
-- Vibration:   avg={sum(vibs)/len(vibs):.3f} m/s2, max={max(vibs):.3f} m/s2
-- Current:     avg={sum(currs)/len(currs):.2f}A, max={max(currs):.2f}A
-- Wear:        start={wears[0]:.3f}, end={wears[-1]:.3f}, progression={wears[-1]-wears[0]:.3f}
-- Tool status: {', '.join(set(statuses))}
-
-Write a concise daily health report covering:
-1. Overall machine health today
-2. Any concerning trends
-3. Maintenance recommendations
-4. Predicted tool life remaining
-Keep it under 200 words, practical and clear."""
+        prompt = f"""Broaching machine daily report. {len(history)} readings today.
+Temp: avg={sum(temps)/len(temps):.1f}C max={max(temps):.1f}C
+Vib: avg={sum(vibs)/len(vibs):.3f} max={max(vibs):.3f} m/s2
+Curr: avg={sum(currs)/len(currs):.2f}A max={max(currs):.2f}A
+Wear: {wears[0]:.3f} -> {wears[-1]:.3f}
+Write a concise daily health report: summary, concerns, maintenance recommendations, predicted tool life. Max 200 words."""
         resp = ai_client.chat.completions.create(
             model=AI_MODEL,
             messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.3,
-            max_tokens=400,
-            stream=False
+            temperature=0.3, max_tokens=400, stream=False
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        log.warning(f'Daily report generation failed: {e}')
+        log.warning(f'Daily report failed: {e}')
         return None
 
-# ── Serial parsing ────────────────────────────────────────────────────────────
+# ── Serial parsing ───────────────────────────────────────────────────────────
 def parse_line(line):
     line = line.strip()
     if not line: return None
@@ -157,20 +162,40 @@ def parse_line(line):
         parts = [p.strip() for p in line.split(',')]
         if len(parts) >= 3:
             return float(parts[0]), float(parts[1]), float(parts[2])
-    except:
-        pass
+    except: pass
     return None
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
-connected = set()
-
+# ── WebSocket handler ────────────────────────────────────────────────────────
 async def ws_handler(ws):
+    global latest_data
     connected.add(ws)
     log.info(f'Browser connected ({len(connected)} clients)')
+    # Send current status immediately
+    await ws.send(json.dumps({'type': 'status', 'status': 'connected'}))
     try:
-        await ws.wait_closed()
+        async for raw_msg in ws:
+            # Handle messages FROM browser (e.g. chat requests)
+            try:
+                msg = json.loads(raw_msg)
+                if msg.get('type') == 'chat':
+                    messages      = msg.get('messages', [])
+                    sensor_ctx    = ''
+                    if latest_data:
+                        sensor_ctx = (f"Temperature: {latest_data.get('temperature_c')}C, "
+                                      f"Vibration: {latest_data.get('vibration_rms_mm_s2')} m/s2, "
+                                      f"Current: {latest_data.get('spindle_current_a')}A, "
+                                      f"Tool Status: {latest_data.get('tool_status')}, "
+                                      f"Wear: {latest_data.get('wear_progression')}")
+                    # Run AI in thread so we don't block
+                    reply = await asyncio.get_event_loop().run_in_executor(
+                        None, ai_chat, messages, sensor_ctx
+                    )
+                    await ws.send(json.dumps({'type': 'chat_reply', 'reply': reply}))
+            except json.JSONDecodeError:
+                pass
     finally:
         connected.discard(ws)
+        log.info(f'Browser disconnected ({len(connected)} clients)')
 
 async def broadcast(data):
     if not connected: return
@@ -181,9 +206,9 @@ async def broadcast(data):
         except: dead.add(c)
     connected.difference_update(dead)
 
-# ── Main serial loop ──────────────────────────────────────────────────────────
+# ── Serial loop ──────────────────────────────────────────────────────────────
 async def serial_loop(port):
-    global last_report_date
+    global latest_data, last_report_date
     ser   = None
     cycle = 0
     while True:
@@ -191,8 +216,10 @@ async def serial_loop(port):
             try:
                 ser = serial.Serial(port, Baud, timeout=1)
                 log.info(f'Opened {port} at {Baud} baud — waiting for data...')
+                await broadcast({'type': 'status', 'status': 'connected'})
             except Exception as e:
                 log.warning(f'Cannot open {port}: {e} — retrying in 3s')
+                await broadcast({'type': 'status', 'status': 'disconnected'})
                 await asyncio.sleep(3)
                 continue
         try:
@@ -200,6 +227,7 @@ async def serial_loop(port):
         except Exception as e:
             log.warning(f'Read error: {e}')
             ser = None
+            await broadcast({'type': 'status', 'status': 'disconnected'})
             await asyncio.sleep(1)
             continue
 
@@ -209,60 +237,55 @@ async def serial_loop(port):
             continue
 
         temp, vib, curr = result
-
-        # Sanity clamp — ignore obviously bad sensor spikes
-        temp = max(0,   min(150, temp))
-        vib  = max(0,   min(50,  vib))
-        curr = max(0,   min(60,  curr))
-
+        temp = max(0, min(150, temp))
+        vib  = max(0, min(50,  vib))
+        curr = max(0, min(60,  curr))
         cycle += 1
 
-        # AI or physics derived parameters
         derived = await asyncio.get_event_loop().run_in_executor(None, ai_derive, temp, vib, curr)
-
         reading = {
-            'timestamp':           datetime.now().isoformat(),
-            'cycle':               cycle,
-            'temperature_c':       round(temp, 2),
-            'vibration_rms_mm_s2': round(vib,  3),
-            'spindle_current_a':   round(curr, 3),
-            'tool_id':             'TB001',
-            'tool_material':       'Carbide',
-            'coating':             'TiN',
-            **derived,
+            'type': 'reading',
+            'data': {
+                'timestamp':           datetime.now().isoformat(),
+                'cycle':               cycle,
+                'temperature_c':       round(temp, 2),
+                'vibration_rms_mm_s2': round(vib,  3),
+                'spindle_current_a':   round(curr, 3),
+                'tool_id':             'TB001',
+                'tool_material':       'Carbide',
+                'coating':             'TiN',
+                **derived,
+            }
         }
-
-        reading_history.append(reading)
-        # Keep last 24h of data (at 1Hz = 86400 max)
+        latest_data = reading['data']
+        reading_history.append(reading['data'])
         if len(reading_history) > 86400:
             reading_history.pop(0)
 
         await broadcast(reading)
         log.info(f'#{cycle} T={temp:.1f}C V={vib:.3f} I={curr:.3f}A -> {derived["tool_status"]} [{derived["prediction_source"]}]')
 
-        # Daily report at midnight (or first run of new day)
+        # Daily report at 23:55
         today = datetime.now().date()
         if last_report_date != today and datetime.now().hour == 23 and datetime.now().minute >= 55:
-            log.info('Generating daily report...')
             report = await asyncio.get_event_loop().run_in_executor(None, generate_daily_report, list(reading_history))
             if report:
                 await broadcast({'type': 'daily_report', 'date': str(today), 'report': report})
-                log.info(f'Daily report:\n{report}')
                 last_report_date = today
-                # Save report to file
                 with open(f'report_{today}.txt', 'w') as f:
                     f.write(f'Daily Report — {today}\n{"="*40}\n{report}\n')
+                log.info(f'Daily report saved: report_{today}.txt')
 
         await asyncio.sleep(0.05)
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 async def main():
-    print('='*50)
-    print('  BROACHING SENSOR BRIDGE v4')
+    print('='*52)
+    print('  BROACHING SENSOR BRIDGE v5')
     print(f'  Arduino  : {ARDUINO_PORT}')
     print(f'  WebSocket: ws://{HOST}:{WS_PORT}/ws')
-    print(f'  AI       : {"NVIDIA API" if AI_AVAILABLE else "Physics math (install openai)"}')
-    print('='*50)
+    print(f'  AI Chat  : {"ENABLED" if AI_AVAILABLE else "install openai"}')
+    print('='*52)
     async with ws_serve(ws_handler, HOST, WS_PORT):
         await serial_loop(ARDUINO_PORT)
 

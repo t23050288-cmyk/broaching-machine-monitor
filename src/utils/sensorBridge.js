@@ -1,77 +1,86 @@
 /**
- * sensorBridge.js  v4.0
- * WebSocket client — connects to local sensor_bridge.py
- * ws://localhost:8765/ws
+ * sensorBridge.js
+ * Manages the WebSocket connection to sensor_bridge.py (localhost:8765)
+ * Handles both sensor readings and AI chat messages.
  */
 
-const WS_URL = 'ws://localhost:8765/ws';
-let ws               = null;
-let reconnectTimer   = null;
-let listeners        = [];
-let connectionStatus = 'disconnected';
+const WS_URL = 'ws://localhost:8765';
 
-export function getBridgeStatus() { return connectionStatus; }
+let ws            = null;
+let status        = 'disconnected';
+let reconnectTimer = null;
+const listeners   = new Set();
+const chatListeners = new Set();
 
-export function onReading(callback) {
-  listeners.push(callback);
-  return () => { listeners = listeners.filter(l => l !== callback); };
+export function getBridgeStatus() {
+  return status;
 }
 
-function notifyListeners(data) {
-  listeners.forEach(l => { try { l(data); } catch (e) { /* ignore */ } });
+function notifyAll(msg) {
+  listeners.forEach(fn => fn(msg));
 }
 
-function setStatus(status) {
-  connectionStatus = status;
-  notifyListeners({ type: 'status', status });
+function notifyChat(reply) {
+  chatListeners.forEach(fn => fn(reply));
+}
+
+export function onReading(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+export function onChatReply(fn) {
+  chatListeners.add(fn);
+  return () => chatListeners.delete(fn);
+}
+
+export function sendChatMessage(messages) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'chat', messages }));
+  }
 }
 
 export function connectBridge() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  setStatus('connecting');
+  ws = new WebSocket(WS_URL);
 
-  try {
-    ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    status = 'connected';
+    notifyAll({ type: 'status', status: 'connected' });
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  };
 
-    ws.onopen = () => {
-      setStatus('connected');
-    };
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'chat_reply') {
+        notifyChat(msg.reply);
+      } else {
+        notifyAll(msg);
+        if (msg.type === 'status') status = msg.status;
+      }
+    } catch (e) {
+      console.warn('Bridge parse error:', e);
+    }
+  };
 
-    ws.onmessage = (event) => {
-      try {
-        const parsed = JSON.parse(event.data);
-        if (parsed.type === 'pong') return;
-        notifyListeners({ type: 'reading', data: parsed });
-      } catch (e) { /* ignore */ }
-    };
+  ws.onerror = () => {
+    status = 'error';
+    notifyAll({ type: 'status', status: 'disconnected' });
+  };
 
-    ws.onclose = (e) => {
-      ws = null;
-      setStatus('disconnected');
-      // reconnect after 2 seconds
-      reconnectTimer = setTimeout(connectBridge, 2000);
-    };
-
-    ws.onerror = () => {
-      // onclose will fire after onerror, so just log
-      setStatus('error');
-    };
-
-  } catch (e) {
+  ws.onclose = () => {
+    status = 'disconnected';
+    notifyAll({ type: 'status', status: 'disconnected' });
     ws = null;
-    setStatus('error');
+    // Auto-reconnect every 3 seconds
     reconnectTimer = setTimeout(connectBridge, 3000);
-  }
+  };
 }
 
 export function disconnectBridge() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) {
-    ws.onclose = null; // prevent auto-reconnect
-    ws.close();
-    ws = null;
-  }
-  setStatus('disconnected');
+  if (ws) { ws.close(); ws = null; }
+  status = 'disconnected';
 }

@@ -1,9 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { onReading, connectBridge } from '../utils/sensorBridge';
-import { MessageCircle, Send, RefreshCw, Bot, User, Trash2 } from 'lucide-react';
-
-// Backend proxy — no CORS issues
-const AI_ENDPOINT = 'https://api.base44.com/api/apps/69c94fa77c9af5dded65069d/functions/askAI';
+import { getBridgeStatus, onReading, connectBridge, sendChatMessage, onChatReply } from '../utils/sensorBridge';
+import { MessageCircle, Send, RefreshCw, Bot, User, Trash2, WifiOff } from 'lucide-react';
 
 const CHAT_KEY = 'bmm_chat_history';
 
@@ -25,24 +22,35 @@ const SUGGESTIONS = [
 ];
 
 export default function Chatbot() {
-  const [messages, setMessages] = useState(() => loadHistory());
-  const [input,    setInput]    = useState('');
-  const [loading,  setLoading]  = useState(false);
-  const [liveData, setLiveData] = useState(null);
-  const bottomRef = useRef(null);
-  const inputRef  = useRef(null);
+  const [messages,     setMessages]     = useState(() => loadHistory());
+  const [input,        setInput]        = useState('');
+  const [loading,      setLoading]      = useState(false);
+  const [liveData,     setLiveData]     = useState(null);
+  const [bridgeStatus, setBridgeStatus] = useState(getBridgeStatus());
+  const bottomRef  = useRef(null);
+  const inputRef   = useRef(null);
+  const pendingRef = useRef(null); // resolve function for pending chat reply
 
   useEffect(() => {
-    const unsub = onReading((msg) => {
+    const unsubRead = onReading((msg) => {
+      if (msg.type === 'status') setBridgeStatus(msg.status);
       if (msg.type === 'reading') setLiveData(msg.data);
     });
+    const unsubChat = onChatReply((reply) => {
+      if (pendingRef.current) {
+        pendingRef.current(reply);
+        pendingRef.current = null;
+      }
+    });
     connectBridge();
-    return () => unsub();
+    return () => { unsubRead(); unsubChat(); };
   }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
+
+  const isConnected = bridgeStatus === 'connected';
 
   async function sendMessage(text) {
     const userText = (text || input).trim();
@@ -56,35 +64,32 @@ export default function Chatbot() {
     setLoading(true);
 
     try {
-      // Build sensor context string if live data available
-      let sensorContext = '';
-      if (liveData) {
-        sensorContext = `Temperature: ${liveData.temperature_c?.toFixed(2)}°C, Vibration: ${liveData.vibration_rms_mm_s2?.toFixed(3)} m/s², Current: ${liveData.spindle_current_a?.toFixed(3)} A, Tool Status: ${liveData.tool_status}, Wear: ${liveData.wear_progression?.toFixed(3)}`;
+      if (!isConnected) {
+        throw new Error('⚠️ Bridge not running. Start sensor_bridge.py first, then try again.');
       }
 
       const history = updated.slice(-10).map(m => ({ role: m.role, content: m.content }));
 
-      const res = await fetch(AI_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history, sensorContext }),
+      // Send chat request through WebSocket to bridge
+      const reply = await new Promise((resolve, reject) => {
+        pendingRef.current = resolve;
+        sendChatMessage(history);
+        // Timeout after 30s
+        setTimeout(() => {
+          if (pendingRef.current) {
+            pendingRef.current = null;
+            reject(new Error('AI response timed out. Check bridge is running.'));
+          }
+        }, 30000);
       });
 
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
-
-      const aiMsg = { role: 'assistant', content: data.reply, ts: Date.now() };
+      const aiMsg = { role: 'assistant', content: reply, ts: Date.now() };
       const final = [...updated, aiMsg];
       setMessages(final);
       saveHistory(final);
     } catch (e) {
-      const errMsg = {
-        role: 'assistant',
-        content: `Sorry, something went wrong: ${e.message}`,
-        ts: Date.now(),
-        error: true,
-      };
-      const final = [...updated, errMsg];
+      const errMsg = { role: 'assistant', content: e.message, ts: Date.now(), error: true };
+      const final  = [...updated, errMsg];
       setMessages(final);
       saveHistory(final);
     } finally {
@@ -112,19 +117,28 @@ export default function Chatbot() {
           </div>
         </div>
         <div className="flex items-center gap-3">
-          {liveData && (
-            <div className="flex items-center gap-1.5 text-[10px] text-[#00e5ff] bg-[#00e5ff]/10 border border-[#00e5ff]/20 px-2.5 py-1 rounded-full">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] animate-pulse"/>
-              Sensors Live
-            </div>
-          )}
+          <div className={`flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full border
+            ${isConnected
+              ? 'text-[#00e5ff] bg-[#00e5ff]/10 border-[#00e5ff]/20'
+              : 'text-[#ffb4ab] bg-[#ffb4ab]/10 border-[#ffb4ab]/20'}`}>
+            {isConnected
+              ? <><span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] animate-pulse"/> Live</>
+              : <><WifiOff size={10}/> Bridge Offline</>}
+          </div>
           {messages.length > 0 && (
-            <button onClick={clearChat} className="text-[#849396] hover:text-[#ffb4ab] transition-colors" title="Clear chat">
+            <button onClick={clearChat} className="text-[#849396] hover:text-[#ffb4ab] transition-colors">
               <Trash2 size={15}/>
             </button>
           )}
         </div>
       </div>
+
+      {/* Offline warning */}
+      {!isConnected && (
+        <div className="mx-4 mt-3 bg-[#ffba38]/10 border border-[#ffba38]/20 rounded-xl px-4 py-3 text-xs text-[#ffba38]">
+          <strong>Bridge not running.</strong> Open Command Prompt → run <code className="bg-[#10141a] px-1 rounded">python sensor_bridge.py</code> → refresh page. Then you can chat!
+        </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 scrollbar-thin">
@@ -152,17 +166,14 @@ export default function Chatbot() {
           <div key={i} className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
             <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5
               ${msg.role === 'user' ? 'bg-[#00e5ff]/20' : 'bg-[#c084fc]/20'}`}>
-              {msg.role === 'user'
-                ? <User size={13} className="text-[#00e5ff]"/>
-                : <Bot  size={13} className="text-[#c084fc]"/>}
+              {msg.role === 'user' ? <User size={13} className="text-[#00e5ff]"/> : <Bot size={13} className="text-[#c084fc]"/>}
             </div>
             <div className={`max-w-[78%] rounded-2xl px-4 py-3 text-sm leading-relaxed
               ${msg.role === 'user'
                 ? 'bg-[#00e5ff]/10 border border-[#00e5ff]/15 text-[#dfe2eb] rounded-tr-sm'
                 : msg.error
                   ? 'bg-[#ffb4ab]/10 border border-[#ffb4ab]/15 text-[#ffb4ab] rounded-tl-sm'
-                  : 'bg-[#181c22] border border-[#3b494c]/20 text-[#dfe2eb] rounded-tl-sm'
-              }`}>
+                  : 'bg-[#181c22] border border-[#3b494c]/20 text-[#dfe2eb] rounded-tl-sm'}`}>
               <div className="whitespace-pre-wrap">{msg.content}</div>
               <div className="text-[9px] text-[#3b494c] mt-1.5">
                 {new Date(msg.ts).toLocaleTimeString('en', {hour:'2-digit', minute:'2-digit'})}
@@ -192,7 +203,7 @@ export default function Chatbot() {
       <div className="px-4 py-4 bg-[#181c22] border-t border-[#3b494c]/15 flex-shrink-0">
         <form onSubmit={e => { e.preventDefault(); sendMessage(); }} className="flex gap-2">
           <input ref={inputRef} value={input} onChange={e => setInput(e.target.value)}
-            placeholder="Ask about tool wear, vibration, maintenance..."
+            placeholder={isConnected ? 'Ask about tool wear, vibration, maintenance...' : 'Start sensor_bridge.py to enable chat...'}
             disabled={loading}
             className="flex-1 bg-[#10141a] border border-[#3b494c]/40 text-[#dfe2eb] text-sm rounded-xl px-4 py-3 outline-none focus:border-[#c084fc]/50 placeholder-[#3b494c] disabled:opacity-50"/>
           <button type="submit" disabled={loading || !input.trim()}
@@ -200,7 +211,7 @@ export default function Chatbot() {
             {loading ? <RefreshCw size={15} className="animate-spin"/> : <Send size={15}/>}
           </button>
         </form>
-        <div className="text-[9px] text-[#3b494c] mt-2 text-center">Powered by NVIDIA AI · Broaching Machine Expert</div>
+        <div className="text-[9px] text-[#3b494c] mt-2 text-center">Powered by NVIDIA AI · Runs via local bridge — no internet CORS issues</div>
       </div>
     </div>
   );
