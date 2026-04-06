@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v5.0
-- Kalman filter on all 3 sensor channels
+Broaching Machine Sensor Bridge v5.1
+- Kalman filter on all 4 sensor channels (temp, vib, curr, volt)
 - FFT vibration frequency analysis (dominant frequency)
 - Remaining life / time estimate
 - MQTT export (optional)
 - Built-in WebSocket ping/pong keepalive
+- v5.1: Added voltage sensor, fixed broadcast to wrap in {type,data} for frontend
 
 INSTALL: pip install pyserial websockets requests
 OPTIONAL MQTT: pip install paho-mqtt
@@ -25,22 +26,21 @@ BAUD         = 9600
 ARDUINO_PORT = 'COM7'
 
 # ── MQTT config (optional) ─────────────────────────────────────
-MQTT_ENABLED = False        # set True to enable
+MQTT_ENABLED = False
 MQTT_BROKER  = 'localhost'
 MQTT_PORT    = 1883
 MQTT_TOPIC   = 'broaching/sensors'
 # ──────────────────────────────────────────────────────────────
 
 THRESHOLDS = {
-    'temperature_c':       {'warn': 82, 'error': 88},
-    'vibration_rms_mm_s2': {'warn': 28, 'error': 33},
-    'spindle_current_a':   {'warn': 41, 'error': 44},
+    'temperature_c':       {'warn': 82,  'error': 88},
+    'vibration_rms_mm_s2': {'warn': 28,  'error': 33},
+    'spindle_current_a':   {'warn': 41,  'error': 44},
+    'supply_voltage_v':    {'warn': 4.8, 'error': 4.5},  # low voltage warning
 }
 
-# Tool life model — typical carbide broach tool life
-TOOL_MAX_CYCLES    = 5000    # max cycles before replacement
-READINGS_PER_CYCLE = 1       # 1 reading ≈ 1 cutting cycle
-
+TOOL_MAX_CYCLES    = 5000
+READINGS_PER_CYCLE = 1
 
 try:
     import serial
@@ -68,32 +68,28 @@ if MQTT_ENABLED:
 
 # ── Kalman Filter ─────────────────────────────────────────────
 class KalmanFilter:
-    """Simple 1D Kalman filter to smooth noisy sensor readings."""
     def __init__(self, process_var=1e-3, measure_var=0.1):
-        self.q = process_var   # process noise
-        self.r = measure_var   # measurement noise
-        self.x = None          # state estimate
-        self.p = 1.0           # error covariance
+        self.q = process_var
+        self.r = measure_var
+        self.x = None
+        self.p = 1.0
 
     def update(self, measurement):
         if self.x is None:
             self.x = measurement
             return measurement
-        # Predict
         self.p += self.q
-        # Update
         k = self.p / (self.p + self.r)
         self.x = self.x + k * (measurement - self.x)
         self.p = (1 - k) * self.p
         return round(self.x, 4)
 
 
-# ── FFT for dominant vibration frequency ─────────────────────
+# ── FFT ───────────────────────────────────────────────────────
 class FFTAnalyzer:
-    """Collect raw vibration samples and compute dominant frequency."""
     def __init__(self, window=64, sample_rate=1.0):
         self.window      = window
-        self.sample_rate = sample_rate   # Hz (1 reading/sec from Arduino)
+        self.sample_rate = sample_rate
         self.buffer      = deque(maxlen=window)
 
     def add(self, value):
@@ -105,9 +101,7 @@ class FFTAnalyzer:
         n    = self.window
         vals = list(self.buffer)
         mean = sum(vals) / n
-        # Remove DC offset
         vals = [v - mean for v in vals]
-        # Manual DFT (magnitudes only, up to Nyquist)
         freqs = []
         for k in range(1, n // 2):
             re_part = sum(vals[i] * math.cos(2*math.pi*k*i/n) for i in range(n))
@@ -122,14 +116,10 @@ class FFTAnalyzer:
 
 # ── Remaining Life Model ──────────────────────────────────────
 class RemainingLifeEstimator:
-    """
-    Estimates remaining tool life based on cumulative wear.
-    Uses wear_progression (0–1.5) as proxy for damage accumulation.
-    """
     def __init__(self):
         self.cumulative_damage = 0.0
         self.cycle_count       = 0
-        self.history           = deque(maxlen=60)   # last 60 readings for trend
+        self.history           = deque(maxlen=60)
 
     def update(self, wear, status):
         damage_per_cycle = {
@@ -143,8 +133,7 @@ class RemainingLifeEstimator:
         return self._estimate()
 
     def _estimate(self):
-        remaining_pct  = max(0.0, 100.0 - self.cumulative_damage)
-        # Avg damage rate over last 60 readings
+        remaining_pct = max(0.0, 100.0 - self.cumulative_damage)
         if len(self.history) >= 5:
             avg_rate = sum(self.history) / len(self.history)
         else:
@@ -153,14 +142,10 @@ class RemainingLifeEstimator:
             cycles_left = TOOL_MAX_CYCLES
         else:
             cycles_left = int(remaining_pct / avg_rate)
-        # Time estimate: 1 reading ≈ 1 sec cycle time
         seconds_left = cycles_left
         hours   = seconds_left // 3600
         minutes = (seconds_left % 3600) // 60
-        if hours > 0:
-            time_str = f'{hours}h {minutes}m'
-        else:
-            time_str = f'{minutes}m'
+        time_str = f'{hours}h {minutes}m' if hours > 0 else f'{minutes}m'
         return {
             'remaining_life_pct':    round(remaining_pct, 1),
             'cycles_remaining':      cycles_left,
@@ -171,39 +156,45 @@ class RemainingLifeEstimator:
 
 
 # ── Global state ──────────────────────────────────────────────
-connected    = set()
+connected      = set()
 latest_reading = None
 
 kalman_temp = KalmanFilter(process_var=0.01, measure_var=0.5)
 kalman_vib  = KalmanFilter(process_var=0.05, measure_var=1.0)
 kalman_curr = KalmanFilter(process_var=0.01, measure_var=0.3)
+kalman_volt = KalmanFilter(process_var=0.005, measure_var=0.1)
 
-fft_analyzer = FFTAnalyzer(window=32, sample_rate=1.0)
+fft_analyzer   = FFTAnalyzer(window=32, sample_rate=1.0)
 life_estimator = RemainingLifeEstimator()
 
 
 def parse_line(line):
+    """
+    Parses Arduino output. Supports:
+      TEMP:25.30,VIB:2.45,CURR:1.20,VOLT:4.95   (with voltage)
+      TEMP:25.30,VIB:2.45,CURR:1.20              (without voltage — volt defaults to None)
+      25.30,2.45,1.20                             (CSV fallback)
+    """
     line = line.strip()
     if not line: return None
     try:
         t = re.search(r'TEMP[:\s]+([-\d.]+)', line, re.IGNORECASE)
         v = re.search(r'VIB[:\s]+([-\d.]+)',  line, re.IGNORECASE)
         c = re.search(r'CURR[:\s]+([-\d.]+)', line, re.IGNORECASE)
+        u = re.search(r'VOLT[:\s]+([-\d.]+)', line, re.IGNORECASE)   # voltage (optional)
         if t and v and c:
-            return float(t.group(1)), float(v.group(1)), float(c.group(1))
+            volt = float(u.group(1)) if u else None
+            return float(t.group(1)), float(v.group(1)), float(c.group(1)), volt
         parts = [p.strip() for p in line.split(',')]
         if len(parts) >= 3:
-            return float(parts[0]), float(parts[1]), float(parts[2])
+            volt = float(parts[3]) if len(parts) >= 4 else None
+            return float(parts[0]), float(parts[1]), float(parts[2]), volt
     except Exception as e:
         log.debug(f'Parse error: {e}')
     return None
 
 
 def multi_sensor_status(temp, vib, curr):
-    """
-    Only triggers FAILED/WORN if at least 2 sensors are in alert range.
-    Prevents false alarms from a single noisy sensor.
-    """
     failed_count = 0
     warn_count   = 0
     if temp > THRESHOLDS['temperature_c']['error']:       failed_count += 1
@@ -212,10 +203,9 @@ def multi_sensor_status(temp, vib, curr):
     elif vib > THRESHOLDS['vibration_rms_mm_s2']['warn']: warn_count   += 1
     if curr > THRESHOLDS['spindle_current_a']['error']:   failed_count += 1
     elif curr > THRESHOLDS['spindle_current_a']['warn']:  warn_count   += 1
-
     if failed_count >= 2: return 'failed'
     if warn_count   >= 2: return 'worn'
-    if failed_count == 1: return 'worn'    # 1 critical = worn, not failed
+    if failed_count == 1: return 'worn'
     return 'new'
 
 
@@ -241,7 +231,8 @@ async def ws_handler(websocket):
     log.info(f'Browser connected — {len(connected)} client(s)')
     if latest_reading:
         try:
-            await websocket.send(json.dumps(latest_reading))
+            # Send wrapped so frontend always gets {type, data}
+            await websocket.send(json.dumps({'type': 'reading', 'data': latest_reading}))
         except Exception:
             pass
     try:
@@ -261,7 +252,8 @@ async def ws_handler(websocket):
 
 async def broadcast(data):
     if not connected: return
-    msg  = json.dumps(data)
+    # Wrap in {type: 'reading', data: ...} so frontend hook works correctly
+    msg  = json.dumps({'type': 'reading', 'data': data})
     dead = set()
     for c in list(connected):
         try:
@@ -298,35 +290,37 @@ async def serial_loop(port):
             await asyncio.sleep(0.05)
             continue
 
-        raw_temp, raw_vib, raw_curr = result
+        raw_temp, raw_vib, raw_curr, raw_volt = result
 
         # ── Kalman filter ──────────────────────────────────────
         temp = kalman_temp.update(raw_temp)
         vib  = kalman_vib.update(raw_vib)
         curr = kalman_curr.update(raw_curr)
+        volt = kalman_volt.update(raw_volt) if raw_volt is not None else None
 
         # ── FFT ───────────────────────────────────────────────
         fft_analyzer.add(vib)
         dom_freq = fft_analyzer.dominant_frequency()
 
-        # ── Multi-sensor status (no false alarms) ─────────────
+        # ── Status ────────────────────────────────────────────
         status  = multi_sensor_status(temp, vib, curr)
         derived = derive(temp, vib, curr, status)
 
-        # ── Remaining life estimate ───────────────────────────
+        # ── Life estimate ─────────────────────────────────────
         life = life_estimator.update(derived['wear_progression'], status)
 
         reading = {
             'timestamp':              datetime.now().isoformat(),
             'cycle':                  life['cycle_count'],
-            # Raw (unfiltered) for reference
             'raw_temp':               round(raw_temp, 2),
             'raw_vib':                round(raw_vib, 2),
             'raw_curr':               round(raw_curr, 2),
-            # Kalman-filtered (what UI shows)
+            'raw_volt':               round(raw_volt, 3) if raw_volt is not None else None,
+            # Filtered values
             'temperature_c':          round(temp, 2),
             'vibration_rms_mm_s2':    round(vib, 2),
             'spindle_current_a':      round(curr, 2),
+            'supply_voltage_v':       round(volt, 3) if volt is not None else None,
             # FFT
             'dominant_freq_hz':       dom_freq,
             # Derived
@@ -334,7 +328,7 @@ async def serial_loop(port):
             'tool_id':                'TB001',
             'tool_material':          'Carbide',
             'coating':                'TiN',
-            # Life estimate
+            # Life
             'remaining_life_pct':     life['remaining_life_pct'],
             'cycles_remaining':       life['cycles_remaining'],
             'estimated_time_left':    life['estimated_time_left'],
@@ -344,15 +338,15 @@ async def serial_loop(port):
         latest_reading = reading
         await broadcast(reading)
 
+        volt_str = f' U={volt:.3f}V' if volt is not None else ''
         log.info(
             f'#{life["cycle_count"]} '
-            f'T={temp:.1f}°C V={vib:.2f} C={curr:.2f}A '
+            f'T={temp:.1f}°C V={vib:.2f} C={curr:.2f}A{volt_str} '
             f'→ {status} | life={life["remaining_life_pct"]}% '
             f'({life["estimated_time_left"]} left)'
             + (f' | FFT={dom_freq:.3f}Hz' if dom_freq else '')
         )
 
-        # ── MQTT publish ──────────────────────────────────────
         if mqtt_client:
             try:
                 mqtt_client.publish(MQTT_TOPIC, json.dumps(reading))
@@ -364,12 +358,11 @@ async def serial_loop(port):
 
 async def main():
     print('=' * 55)
-    print('  BROACHING SENSOR BRIDGE v5.0')
+    print('  BROACHING SENSOR BRIDGE v5.1')
     print(f'  Arduino   : {ARDUINO_PORT}')
-    print(f'  WebSocket : ws://localhost:{WS_PORT}/ws')
+    print(f'  WebSocket : ws://localhost:{WS_PORT}')
     print(f'  MQTT      : {"enabled → " + MQTT_BROKER if MQTT_ENABLED else "disabled"}')
-    print('  Features  : Kalman filter | FFT | Multi-param alerts')
-    print('             Remaining life estimate | MQTT export')
+    print('  Features  : Kalman | FFT | Voltage | Life | MQTT')
     print('=' * 55)
     async with ws_serve(
         ws_handler, HOST, WS_PORT,
