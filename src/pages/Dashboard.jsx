@@ -5,7 +5,7 @@ import LiveChart from '../components/LiveChart';
 import StatusBadge from '../components/StatusBadge';
 import ConnectionBanner from '../components/ConnectionBanner';
 import { getSettings } from '../utils/storage';
-import { Thermometer, Zap, Activity, Gauge, Wind, Volume2, FlaskConical, Wifi, Clock, RefreshCw, BarChart2 } from 'lucide-react';
+import { Thermometer, Zap, Activity, Gauge, Wind, Volume2, FlaskConical, Wifi, Clock, RefreshCw, BarChart2, Battery } from 'lucide-react';
 
 function MetricCard({ icon: Icon, label, value, unit, color = '#00daf3', alert }) {
   return (
@@ -45,7 +45,6 @@ function WearLifeCard({ wear, remainingPct, cyclesLeft, timeLeft, status }) {
         </span>
       </div>
 
-      {/* Progress bar */}
       <div className="mb-4">
         <div className="flex justify-between text-[9px] text-[#849396] mb-1.5">
           <span>TOOL LIFE REMAINING</span>
@@ -57,7 +56,6 @@ function WearLifeCard({ wear, remainingPct, cyclesLeft, timeLeft, status }) {
         </div>
       </div>
 
-      {/* Stats row */}
       <div className="grid grid-cols-3 gap-3">
         <div className="bg-[#10141a] rounded-lg p-3 text-center">
           <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">Wear Index</div>
@@ -105,8 +103,6 @@ function FFTCard({ domFreq }) {
   );
 }
 
-const DEFAULT_SIM = { temperature_c: 65, vibration_rms_mm_s2: 3.5, spindle_current_a: 5.2 };
-
 export default function Dashboard() {
   const { bridgeStatus, latest, chartData, activeAlerts, isFlashing, connect } = useSensorData();
   const s = getSettings();
@@ -115,6 +111,7 @@ export default function Dashboard() {
   const [simTemp, setSimTemp] = useState('65');
   const [simVib,  setSimVib]  = useState('3.5');
   const [simCurr, setSimCurr] = useState('5.2');
+  const [simVolt, setSimVolt] = useState('4.95');
 
   const r = simMode
     ? {
@@ -122,6 +119,7 @@ export default function Dashboard() {
         temperature_c:       parseFloat(simTemp) || 0,
         vibration_rms_mm_s2: parseFloat(simVib)  || 0,
         spindle_current_a:   parseFloat(simCurr) || 0,
+        supply_voltage_v:    parseFloat(simVolt) || 0,
         cutting_force_n:     Math.round((parseFloat(simCurr)||0)*240 + (parseFloat(simVib)||0)*15 + ((parseFloat(simTemp)||25)-25)*50),
         acoustic_emission_db: Math.round((parseFloat(simCurr)||0)*12  + (parseFloat(simVib)||0)*2.5 + 200),
         coolant_flow_lmin:   Math.round(18 + ((parseFloat(simTemp)||25)-25)*0.2),
@@ -135,10 +133,12 @@ export default function Dashboard() {
       }
     : latest;
 
-  const tempAlert  = r && r.temperature_c        > s.tempLimit;
-  const vibAlert   = r && r.vibration_rms_mm_s2  > s.vibLimit;
-  const currAlert  = r && r.spindle_current_a    > s.currentLimit;
-  const forceAlert = r && r.cutting_force_n      > s.forceLimit;
+  const tempAlert  = r && r.temperature_c       > s.tempLimit;
+  const vibAlert   = r && r.vibration_rms_mm_s2 > s.vibLimit;
+  const currAlert  = r && r.spindle_current_a   > s.currentLimit;
+  const forceAlert = r && r.cutting_force_n     > s.forceLimit;
+  // Low voltage alert: warn if below 4.8V
+  const voltAlert  = r && r.supply_voltage_v != null && r.supply_voltage_v < 4.8 && r.supply_voltage_v > 0;
 
   return (
     <div className={`p-6 space-y-6 ${isFlashing && !simMode ? 'ring-2 ring-[#ffb4ab] ring-inset' : ''} transition-all`}>
@@ -176,10 +176,11 @@ export default function Dashboard() {
           <div className="text-[10px] uppercase tracking-[0.2em] text-[#ffba38] mb-4 font-bold flex items-center gap-2">
             <FlaskConical size={12}/> Simulation Mode — enter test values
           </div>
-          <div className="grid grid-cols-3 gap-4">
-            {[['Temperature (°C)', simTemp, setSimTemp, '#ff9259', '0', '150', '1', 'Normal: 20-40°C | High: 60-90°C'],
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[['Temperature (°C)', simTemp, setSimTemp, '#ff9259', '0', '150', '1',   'Normal: 20-40°C | High: 60-90°C'],
               ['Vibration (m/s²)', simVib,  setSimVib,  '#00e5ff', '0', '20',  '0.1', 'Normal: 0.5-3 | High: 5-10+'],
               ['Current (A)',      simCurr, setSimCurr, '#818cf8', '0', '60',  '0.1', 'Idle: 0-1A | Cutting: 5-45A'],
+              ['Voltage (V)',      simVolt, setSimVolt, '#4ade80', '0', '12',  '0.1', 'Normal: 4.8-5.2V (USB) or battery'],
             ].map(([label, val, setter, color, min, max, step, hint]) => (
               <div key={label}>
                 <label className="block text-[10px] uppercase tracking-wider mb-1.5" style={{ color }}>{label}</label>
@@ -191,10 +192,10 @@ export default function Dashboard() {
             ))}
           </div>
           <div className="mt-3 flex gap-2 flex-wrap">
-            {[{label:'Idle',t:'27',v:'0.9',c:'0.1'},{label:'Light Cut',t:'45',v:'2.5',c:'8'},
-              {label:'Normal',t:'65',v:'3.5',c:'18'},{label:'Heavy',t:'80',v:'6.0',c:'35'},{label:'Critical',t:'90',v:'9.0',c:'45'}
+            {[{label:'Idle',t:'27',v:'0.9',c:'0.1',u:'4.95'},{label:'Light Cut',t:'45',v:'2.5',c:'8',u:'4.90'},
+              {label:'Normal',t:'65',v:'3.5',c:'18',u:'4.85'},{label:'Heavy',t:'80',v:'6.0',c:'35',u:'4.75'},{label:'Critical',t:'90',v:'9.0',c:'45',u:'4.60'}
             ].map(p => (
-              <button key={p.label} onClick={() => { setSimTemp(p.t); setSimVib(p.v); setSimCurr(p.c); }}
+              <button key={p.label} onClick={() => { setSimTemp(p.t); setSimVib(p.v); setSimCurr(p.c); setSimVolt(p.u); }}
                 className="text-[10px] px-2.5 py-1 rounded-lg bg-[#10141a] border border-[#3b494c]/40 text-[#849396] hover:text-[#dfe2eb] hover:border-[#dfe2eb]/30 transition-colors">
                 {p.label}
               </button>
@@ -203,12 +204,32 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Gauges */}
+      {/* ── Top 4 Gauges: Temp | Current | Voltage | Wear ── */}
       <div className="bg-[#181c22] rounded-xl p-6 flex justify-around flex-wrap gap-6">
-        <GaugeCircle value={r?.temperature_c ?? 0}       max={100} unit="°C"    label="Temperature"    color={tempAlert ? '#ffb4ab' : '#00daf3'}/>
-        <GaugeCircle value={r?.vibration_rms_mm_s2 ?? 0} max={40}  unit="mm/s²" label="Vibration RMS"   color={vibAlert  ? '#ffb4ab' : '#00daf3'}/>
-        <GaugeCircle value={r?.spindle_current_a ?? 0}   max={50}  unit="A"     label="Spindle Current" color={currAlert ? '#ffb4ab' : '#00daf3'}/>
-        <GaugeCircle value={r?.wear_progression ?? 0}    max={1.5} unit="wear"  label="Wear Index"      color="#ffba38"/>
+        <GaugeCircle
+          value={r?.temperature_c ?? 0}
+          max={100} unit="°C"
+          label="Temperature"
+          color={tempAlert ? '#ffb4ab' : '#00daf3'}
+        />
+        <GaugeCircle
+          value={r?.spindle_current_a ?? 0}
+          max={50} unit="A"
+          label="Spindle Current"
+          color={currAlert ? '#ffb4ab' : '#818cf8'}
+        />
+        <GaugeCircle
+          value={r?.supply_voltage_v ?? 0}
+          max={6} unit="V"
+          label="Supply Voltage"
+          color={voltAlert ? '#ffb4ab' : '#4ade80'}
+        />
+        <GaugeCircle
+          value={r?.wear_progression ?? 0}
+          max={1.5} unit="wear"
+          label="Wear Index"
+          color="#ffba38"
+        />
       </div>
 
       {/* ── Tool Life Predictor ── */}
@@ -225,24 +246,27 @@ export default function Dashboard() {
 
       {/* Metric cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-        <MetricCard icon={Thermometer} label="Temperature"   value={r?.temperature_c?.toFixed(1) ?? '--'}       unit="°C"    color="#00daf3" alert={tempAlert}/>
-        <MetricCard icon={Activity}    label="Vibration"     value={r?.vibration_rms_mm_s2?.toFixed(1) ?? '--'} unit="mm/s²" color="#00daf3" alert={vibAlert}/>
-        <MetricCard icon={Zap}         label="Current"       value={r?.spindle_current_a?.toFixed(1) ?? '--'}   unit="A"     color="#00daf3" alert={currAlert}/>
-        <MetricCard icon={Gauge}       label="Cutting Force" value={r?.cutting_force_n?.toFixed(0) ?? '--'}     unit="N"     color="#ffba38" alert={forceAlert}/>
-        <MetricCard icon={Volume2}     label="Acoustic Emis" value={r?.acoustic_emission_db?.toFixed(1) ?? '--'} unit="dB"   color="#ffd799"/>
-        <MetricCard icon={Wind}        label="Coolant Flow"  value={r?.coolant_flow_lmin?.toFixed(1) ?? '--'}   unit="L/min" color="#9cf0ff"/>
+        <MetricCard icon={Thermometer} label="Temperature"   value={r?.temperature_c?.toFixed(1) ?? '--'}        unit="°C"    color="#00daf3" alert={tempAlert}/>
+        <MetricCard icon={Activity}    label="Vibration"     value={r?.vibration_rms_mm_s2?.toFixed(2) ?? '--'}  unit="m/s²"  color="#00daf3" alert={vibAlert}/>
+        <MetricCard icon={Zap}         label="Current"       value={r?.spindle_current_a?.toFixed(2) ?? '--'}    unit="A"     color="#818cf8" alert={currAlert}/>
+        <MetricCard icon={Battery}     label="Voltage"       value={r?.supply_voltage_v != null ? r.supply_voltage_v.toFixed(2) : '--'} unit="V" color={voltAlert ? '#ffb4ab' : '#4ade80'} alert={voltAlert}/>
+        <MetricCard icon={Gauge}       label="Cutting Force" value={r?.cutting_force_n?.toFixed(0) ?? '--'}      unit="N"     color="#ffba38" alert={forceAlert}/>
+        <MetricCard icon={Wind}        label="Coolant Flow"  value={r?.coolant_flow_lmin?.toFixed(1) ?? '--'}    unit="L/min" color="#9cf0ff"/>
       </div>
 
       {/* Charts */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-[#1c2026] rounded-xl p-4">
           <LiveChart data={chartData} dataKey="temperature_c"       color="#00daf3" label="Temperature °C"  limit={s.tempLimit}/>
         </div>
         <div className="bg-[#1c2026] rounded-xl p-4">
-          <LiveChart data={chartData} dataKey="vibration_rms_mm_s2" color="#ffba38" label="Vibration mm/s²" limit={s.vibLimit}/>
+          <LiveChart data={chartData} dataKey="spindle_current_a"   color="#818cf8" label="Current A"       limit={s.currentLimit}/>
         </div>
         <div className="bg-[#1c2026] rounded-xl p-4">
-          <LiveChart data={chartData} dataKey="spindle_current_a"   color="#818cf8" label="Current A"       limit={s.currentLimit}/>
+          <LiveChart data={chartData} dataKey="supply_voltage_v"    color="#4ade80" label="Voltage V"/>
+        </div>
+        <div className="bg-[#1c2026] rounded-xl p-4">
+          <LiveChart data={chartData} dataKey="vibration_rms_mm_s2" color="#ffba38" label="Vibration m/s²"  limit={s.vibLimit}/>
         </div>
       </div>
     </div>
