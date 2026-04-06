@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v5.1
-- Fixed: websockets compatibility (removed 'path' arg)
-- Fixed: COM port set to COM7
-- Reads Arduino via serial, streams to browser via WebSocket
-- Handles AI chat from browser
+Broaching Machine Sensor Bridge v5.2
+- Fixed: tool status flickering (3-reading stability filter)
+- Fixed: smooth sensor averaging (rolling window)
+- COM7, websockets compat fix
 
 INSTALL: pip install pyserial websockets openai
 RUN:     python sensor_bridge.py
@@ -12,6 +11,7 @@ RUN:     python sensor_bridge.py
 
 import asyncio, json, re, logging, sys
 from datetime import datetime
+from collections import deque
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -19,16 +19,19 @@ log = logging.getLogger(__name__)
 HOST         = 'localhost'
 WS_PORT      = 8765
 BAUD         = 9600
-ARDUINO_PORT = 'COM7'   # <-- your Arduino port
+ARDUINO_PORT = 'COM7'
 
 NVIDIA_API_KEY  = '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'
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
 AI_MODEL        = 'meta/llama-3.1-8b-instruct'
 
+# Stability: status only changes after this many consecutive same readings
+STATUS_CONFIRM = 3
+
 CHAT_SYSTEM = """You are KineticAI, an expert assistant for broaching machine monitoring and tool life management.
 You have deep knowledge of broaching machine operations, tool wear, sensor data interpretation,
 cutting parameters, coolant systems, coatings, and safety protocols.
-Be concise, practical, and helpful. Use simple language."""
+Be concise, practical, and helpful."""
 
 try:
     import serial
@@ -36,7 +39,6 @@ except ImportError:
     log.error('Run: pip install pyserial'); sys.exit(1)
 
 try:
-    import websockets
     from websockets.asyncio.server import serve as ws_serve
     NEW_WS = True
 except ImportError:
@@ -48,27 +50,49 @@ except ImportError:
 
 try:
     from openai import OpenAI
-    ai_client   = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
+    ai_client    = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
     AI_AVAILABLE = True
     log.info('AI enabled via NVIDIA API')
 except ImportError:
     AI_AVAILABLE = False
-    log.warning('openai not installed — run: pip install openai')
+    log.warning('openai not installed - run: pip install openai')
 
-# ── Shared state ────────────────────────────────────────────────────────────
+# ---------- Shared state --------------------------------------------------
 connected       = set()
 latest_data     = None
 reading_history = []
 
-# ── Physics fallback ────────────────────────────────────────────────────────
+# Rolling window for smoothing raw sensor values (last 5 readings)
+temp_buf = deque(maxlen=5)
+vib_buf  = deque(maxlen=5)
+curr_buf = deque(maxlen=5)
+
+# Stability filter for tool status
+status_candidates = deque(maxlen=STATUS_CONFIRM)
+stable_status     = 'new'
+
+def smooth(buf, val):
+    buf.append(val)
+    return sum(buf) / len(buf)
+
+def stabilize_status(new_status):
+    """Only accept a status change if STATUS_CONFIRM readings agree."""
+    global stable_status
+    status_candidates.append(new_status)
+    if len(status_candidates) == STATUS_CONFIRM and len(set(status_candidates)) == 1:
+        stable_status = new_status
+    return stable_status
+
+# ---------- Physics fallback ----------------------------------------------
 def physics_derive(temp, vib, curr):
     force   = max(2500, min(11500, curr*240 + vib*15 + (temp-25)*50))
     ae      = max(300,  min(650,   curr*12  + vib*2.5 + 200))
     wear    = min(1.5,  max(0,     (vib - 0.5) / 8.0 * 1.5))
     surface = 0.5 if vib < 2.5 else (0.8 if vib < 5 else 1.2)
-    if   vib > 8.0 or temp > 88 or curr > 44: status = 'failed'
-    elif vib > 5.0 or temp > 82 or curr > 41: status = 'worn'
-    else:                                       status = 'new'
+    if   vib > 8.0 or temp > 88 or curr > 44: raw_status = 'failed'
+    elif vib > 5.0 or temp > 82 or curr > 41: raw_status = 'worn'
+    else:                                       raw_status = 'new'
+    status = stabilize_status(raw_status)
     return {
         'cutting_force_n':      round(force, 1),
         'acoustic_emission_db': round(ae, 1),
@@ -86,12 +110,14 @@ def ai_derive(temp, vib, curr):
         return physics_derive(temp, vib, curr)
     try:
         prompt = f"""You are an expert in broaching machine tool monitoring.
-Given live sensor readings:
+Live sensor readings:
 - Temperature: {temp:.2f} C
 - Vibration RMS: {vib:.3f} m/s2
 - Spindle Current: {curr:.3f} A
-Predict (respond ONLY with valid JSON):
-{{"cutting_force_n":<2500-11500>,"acoustic_emission_db":<300-650>,"surface_finish_ra_um":<0.2-2.0>,"wear_progression":<0.0-1.5>,"tool_status":"new" or "worn" or "failed","spindle_speed_mmin":<10-30>,"feed_rate_mmtooth":<0.04-0.12>,"coolant_flow_lmin":<15-25>}}"""
+
+IMPORTANT: Current below 1A means machine is IDLE (no cutting). Predict realistically.
+Respond ONLY with valid JSON:
+{{"cutting_force_n":<number 2500-11500>,"acoustic_emission_db":<number 300-650>,"surface_finish_ra_um":<number 0.2-2.0>,"wear_progression":<number 0.0-1.5>,"tool_status":"new" or "worn" or "failed","spindle_speed_mmin":<number 10-30>,"feed_rate_mmtooth":<number 0.04-0.12>,"coolant_flow_lmin":<number 15-25>}}"""
         resp = ai_client.chat.completions.create(
             model=AI_MODEL,
             messages=[{'role':'user','content':prompt}],
@@ -101,6 +127,8 @@ Predict (respond ONLY with valid JSON):
         m = re.search(r'\{[^{}]+\}', text, re.DOTALL)
         if m:
             result = json.loads(m.group())
+            # Apply stability filter to AI status too
+            result['tool_status']      = stabilize_status(result.get('tool_status', 'new'))
             result['prediction_source'] = 'ai'
             return result
     except Exception as e:
@@ -123,7 +151,7 @@ def ai_chat(messages, sensor_context=''):
     except Exception as e:
         return f'AI error: {e}'
 
-# ── Serial parsing ───────────────────────────────────────────────────────────
+# ---------- Serial parsing ------------------------------------------------
 def parse_line(line):
     line = line.strip()
     if not line: return None
@@ -140,7 +168,7 @@ def parse_line(line):
         pass
     return None
 
-# ── WebSocket broadcast ──────────────────────────────────────────────────────
+# ---------- WebSocket broadcast -------------------------------------------
 async def broadcast(data):
     if not connected: return
     msg  = json.dumps(data)
@@ -150,10 +178,9 @@ async def broadcast(data):
         except: dead.add(c)
     connected.difference_update(dead)
 
-# ── WebSocket handler ────────────────────────────────────────────────────────
+# ---------- WebSocket handler ---------------------------------------------
 async def ws_handler(ws):
     global latest_data
-    # websockets legacy API passes (ws, path), new API passes just ws
     connected.add(ws)
     log.info(f'Browser connected ({len(connected)} clients)')
     await ws.send(json.dumps({'type': 'status', 'status': 'connected'}))
@@ -162,8 +189,8 @@ async def ws_handler(ws):
             try:
                 msg = json.loads(raw)
                 if msg.get('type') == 'chat':
-                    messages   = msg.get('messages', [])
-                    ctx        = ''
+                    messages = msg.get('messages', [])
+                    ctx = ''
                     if latest_data:
                         ctx = (f"Temperature: {latest_data.get('temperature_c')}C, "
                                f"Vibration: {latest_data.get('vibration_rms_mm_s2')} m/s2, "
@@ -178,11 +205,10 @@ async def ws_handler(ws):
         connected.discard(ws)
         log.info(f'Browser disconnected ({len(connected)} clients)')
 
-# ── Legacy handler wrapper (for older websockets that passes path) ────────────
 async def ws_handler_legacy(ws, path=None):
     await ws_handler(ws)
 
-# ── Serial loop ──────────────────────────────────────────────────────────────
+# ---------- Serial loop ---------------------------------------------------
 async def serial_loop(port):
     global latest_data
     ser   = None
@@ -191,10 +217,10 @@ async def serial_loop(port):
         if ser is None or not ser.is_open:
             try:
                 ser = serial.Serial(port, BAUD, timeout=1)
-                log.info(f'Opened {port} at {BAUD} baud — waiting for data...')
+                log.info(f'Opened {port} at {BAUD} baud - waiting for data...')
                 await broadcast({'type': 'status', 'status': 'connected'})
             except Exception as e:
-                log.warning(f'Cannot open {port}: {e} — retrying in 3s')
+                log.warning(f'Cannot open {port}: {e} - retrying in 3s')
                 await broadcast({'type': 'status', 'status': 'disconnected'})
                 await asyncio.sleep(3)
                 continue
@@ -211,13 +237,21 @@ async def serial_loop(port):
             await asyncio.sleep(0.05)
             continue
 
-        temp, vib, curr = result
-        temp = max(0, min(150, temp))
-        vib  = max(0, min(50,  vib))
-        curr = max(0, min(60,  curr))
-        cycle += 1
+        temp_raw, vib_raw, curr_raw = result
 
+        # Clamp to valid ranges
+        temp_raw = max(0,  min(150, temp_raw))
+        vib_raw  = max(0,  min(50,  vib_raw))
+        curr_raw = max(0,  min(60,  curr_raw))
+
+        # Smooth with rolling average
+        temp = smooth(temp_buf, temp_raw)
+        vib  = smooth(vib_buf,  vib_raw)
+        curr = smooth(curr_buf, curr_raw)
+
+        cycle += 1
         derived = await asyncio.get_event_loop().run_in_executor(None, ai_derive, temp, vib, curr)
+
         reading = {
             'type': 'reading',
             'data': {
@@ -241,22 +275,20 @@ async def serial_loop(port):
         log.info(f'#{cycle} T={temp:.1f}C V={vib:.3f} I={curr:.3f}A -> {derived["tool_status"]} [{derived["prediction_source"]}]')
         await asyncio.sleep(0.05)
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ---------- Main ----------------------------------------------------------
 async def main():
     print('=' * 52)
-    print('  BROACHING SENSOR BRIDGE v5.1')
+    print('  BROACHING SENSOR BRIDGE v5.2')
     print(f'  Arduino  : {ARDUINO_PORT}')
     print(f'  WebSocket: ws://{HOST}:{WS_PORT}')
     print(f'  AI       : {"ENABLED" if AI_AVAILABLE else "install openai"}')
+    print(f'  Stability: {STATUS_CONFIRM} readings to confirm status')
     print('=' * 52)
 
-    # Support both new and old websockets versions
     try:
-        # New websockets (>=12) — no 'path' argument
         from websockets.asyncio.server import serve as ws_serve_new
         server = ws_serve_new(ws_handler, HOST, WS_PORT)
     except ImportError:
-        # Old websockets (<12)
         import websockets as _ws
         server = _ws.serve(ws_handler_legacy, HOST, WS_PORT)
 
