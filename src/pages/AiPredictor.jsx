@@ -1,517 +1,310 @@
 import { useState, useEffect, useRef } from 'react';
-import { getBridgeStatus, onReading, connectBridge } from '../utils/sensorBridge';
-import { getReadings, getSettings } from '../utils/storage';
-import { Brain, Cpu, RefreshCw, AlertTriangle, CheckCircle, XCircle, Clock, Download, ChevronDown, ChevronUp, Wifi, WifiOff } from 'lucide-react';
+import { onReading, connectBridge, getBridgeStatus, sendChatMessage, onChatReply } from '../utils/sensorBridge';
+import { Brain, Zap, ThermometerSun, Activity, Gauge, RefreshCw, Wifi, WifiOff, Lock, Unlock } from 'lucide-react';
 
-const NVIDIA_KEY  = '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';
-const NVIDIA_URL  = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const AI_MODEL    = 'meta/llama-3.1-8b-instruct';
+const PREDICT_PROMPT = (temp, vib, curr, speed, feed, depth, coolant, hardness) => `
+You are an expert in broaching machine tool condition monitoring.
+Analyze these parameters and predict tool status:
 
-const DAILY_REPORT_KEY = 'bmm_daily_reports';
-const LAST_AUTO_KEY    = 'bmm_last_auto_report';
+SENSOR READINGS (live):
+- Temperature: ${temp} °C
+- Vibration RMS: ${vib} m/s²
+- Spindle Current: ${curr} A
 
-function getDailyReports() {
-  try { return JSON.parse(localStorage.getItem(DAILY_REPORT_KEY) || '[]'); }
-  catch { return []; }
-}
-function saveDailyReport(report) {
-  const reports = getDailyReports();
-  reports.unshift(report);
-  localStorage.setItem(DAILY_REPORT_KEY, JSON.stringify(reports.slice(0, 30)));
-}
+CUTTING PARAMETERS:
+- Spindle Speed: ${speed} RPM
+- Feed Rate: ${feed} mm/rev
+- Depth of Cut: ${depth} mm
+- Coolant Flow: ${coolant} L/min
+- Workpiece Hardness: ${hardness} HB
 
-async function callAI(prompt) {
-  const res = await fetch(NVIDIA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${NVIDIA_KEY}` },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.15,
-      max_tokens: 600,
-      stream: false,
-    }),
-  });
-  if (!res.ok) throw new Error(`AI API error: ${res.status}`);
-  const data = await res.json();
-  return data.choices[0].message.content.trim();
+Respond ONLY with valid JSON (no extra text):
+{"tool_status":"new" or "worn" or "failed","wear_progression":<0.0-1.5>,"cutting_force_n":<2500-11500>,"acoustic_emission_db":<300-650>,"surface_finish_ra_um":<0.2-2.0>,"remaining_life_percent":<0-100>,"recommendation":"<one sentence action>","confidence":<50-99>}
+`;
+
+function statusColor(s) {
+  if (!s) return '#849396';
+  const l = s.toLowerCase();
+  if (l === 'new')    return '#00e5ff';
+  if (l === 'worn')   return '#ffba38';
+  return '#ffb4ab';
 }
 
 export default function AiPredictor() {
-  const [bridgeStatus, setBridgeStatus] = useState(getBridgeStatus());
-  const [liveReading,  setLiveReading]  = useState(null);
-  const [form, setForm] = useState({
-    toolId: 'TB001', toolMaterial: 'Carbide', coating: 'TiN', workpiece: 'Steel',
-    toolAge: '', cyclesCompleted: '', spindleSpeed: '', feedRate: '',
-    depthOfCut: '2.0', coolantFlow: '18', hardness: '200',
-    temperature: '', vibration: '', current: '',
-  });
-  const [predicting, setPredicting] = useState(false);
-  const [result,     setResult]     = useState(null);
-  const [error,      setError]      = useState('');
-  const [reports,    setReports]    = useState(getDailyReports());
-  const [genReport,  setGenReport]  = useState(false);
-  const [reportText, setReportText] = useState('');
-  const [expanded,   setExpanded]   = useState(null);
-  const intervalRef = useRef(null);
+  // Live sensor values from bridge
+  const [liveTemp, setLiveTemp] = useState('');
+  const [liveVib,  setLiveVib]  = useState('');
+  const [liveCurr, setLiveCurr] = useState('');
 
-  // Listen for live sensor data
+  // Whether user has locked (manually overridden) the sensor fields
+  const [locked, setLocked] = useState(false);
+
+  // Displayed / editable sensor fields
+  const [temp,    setTemp]    = useState('');
+  const [vib,     setVib]     = useState('');
+  const [curr,    setCurr]    = useState('');
+
+  // Cutting parameters
+  const [speed,     setSpeed]     = useState('4');
+  const [feed,      setFeed]      = useState('0.15');
+  const [depth,     setDepth]     = useState('2.0');
+  const [coolant,   setCoolant]   = useState('18');
+  const [hardness,  setHardness]  = useState('200');
+
+  const [result,   setResult]   = useState(null);
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState('');
+  const [bridge,   setBridge]   = useState(getBridgeStatus());
+
+  const pendingRef = useRef(null);
+
   useEffect(() => {
-    const unsub = onReading((msg) => {
-      if (msg.type === 'status') setBridgeStatus(msg.status);
+    const unsubRead = onReading((msg) => {
+      if (msg.type === 'status') setBridge(msg.status);
       if (msg.type === 'reading') {
-        setLiveReading(msg.data);
-        setForm(prev => ({
-          ...prev,
-          temperature: msg.data.temperature_c?.toFixed(2)  ?? prev.temperature,
-          vibration:   msg.data.vibration_rms_mm_s2?.toFixed(3) ?? prev.vibration,
-          current:     msg.data.spindle_current_a?.toFixed(3)   ?? prev.current,
-        }));
+        const d = msg.data;
+        setLiveTemp(String(d.temperature_c ?? ''));
+        setLiveVib(String(d.vibration_rms_mm_s2 ?? ''));
+        setLiveCurr(String(d.spindle_current_a ?? ''));
+        // Only update display fields if user hasn't locked them
+        if (!locked) {
+          setTemp(String(d.temperature_c ?? ''));
+          setVib(String(d.vibration_rms_mm_s2 ?? ''));
+          setCurr(String(d.spindle_current_a ?? ''));
+        }
+      }
+    });
+    const unsubChat = onChatReply((reply) => {
+      if (pendingRef.current) {
+        pendingRef.current(reply);
+        pendingRef.current = null;
       }
     });
     connectBridge();
-    return () => unsub();
-  }, []);
+    return () => { unsubRead(); unsubChat(); };
+  }, [locked]);
 
-  // Auto daily report check — runs once per day
-  useEffect(() => {
-    const checkAutoReport = () => {
-      const last = localStorage.getItem(LAST_AUTO_KEY);
-      const today = new Date().toDateString();
-      if (last === today) return;
-      const readings = getReadings();
-      if (readings.length < 10) return;
-      const now = new Date();
-      // Trigger at 11 PM or later if not done today
-      if (now.getHours() >= 23) {
-        handleGenerateReport(readings, true);
-        localStorage.setItem(LAST_AUTO_KEY, today);
-      }
-    };
-    checkAutoReport();
-    intervalRef.current = setInterval(checkAutoReport, 60 * 60 * 1000); // check every hour
-    return () => clearInterval(intervalRef.current);
-  }, []);
+  const isConnected = bridge === 'connected';
 
-  const update = (k, v) => setForm(prev => ({ ...prev, [k]: v }));
-
-  const isConnected = bridgeStatus === 'connected';
-
-  async function handlePredict() {
+  async function predict() {
+    const t = parseFloat(temp);
+    const v = parseFloat(vib);
+    const c = parseFloat(curr);
+    if (isNaN(t) || isNaN(v) || isNaN(c)) {
+      setError('Please enter Temperature, Vibration, and Current values first.');
+      return;
+    }
+    setLoading(true);
     setError('');
     setResult(null);
 
-    if (!isConnected) {
-      setError('⚠ Sensors not connected. Please start sensor_bridge.py and connect the Arduino via USB first.');
-      return;
-    }
-    if (!form.temperature || !form.vibration || !form.current) {
-      setError('⚠ Sensor readings (Temperature, Vibration, Current) are required. Waiting for live data...');
-      return;
-    }
+    const prompt = PREDICT_PROMPT(t, v, c, speed, feed, depth, coolant, hardness);
 
-    setPredicting(true);
     try {
-      const prompt = `You are an expert broaching tool life prediction system.
+      if (!isConnected) throw new Error('Bridge not running. Start sensor_bridge.py first.');
 
-Live sensor readings from the broaching machine:
-- Temperature: ${form.temperature} °C
-- Vibration RMS: ${form.vibration} m/s²
-- Spindle Current: ${form.current} A
+      // Send through WebSocket bridge — no CORS issues
+      const reply = await new Promise((resolve, reject) => {
+        pendingRef.current = resolve;
+        sendChatMessage([{ role: 'user', content: prompt }]);
+        setTimeout(() => {
+          if (pendingRef.current) {
+            pendingRef.current = null;
+            reject(new Error('AI timed out. Is the bridge still running?'));
+          }
+        }, 30000);
+      });
 
-Tool configuration:
-- Tool ID: ${form.toolId}
-- Material: ${form.toolMaterial}
-- Coating: ${form.coating}
-- Workpiece: ${form.workpiece}
-- Tool Age: ${form.toolAge || 'unknown'} hours
-- Cycles Completed: ${form.cyclesCompleted || 'unknown'}
-- Spindle Speed: ${form.spindleSpeed || 'auto'} RPM
-- Feed Rate: ${form.feedRate || 'auto'} mm/rev
-- Depth of Cut: ${form.depthOfCut} mm
-- Coolant Flow: ${form.coolantFlow} L/min
-
-Based on these readings, provide a detailed tool life prediction. Respond ONLY with valid JSON:
-{
-  "status": "Good/Safe" or "Warning" or "Critical/Replace Now",
-  "condition": "one line summary of tool condition",
-  "wear_percent": <0-100>,
-  "remaining_life_hours": <estimated hours remaining>,
-  "remaining_cycles": <estimated cycles remaining>,
-  "cutting_force_n": <predicted cutting force in Newtons>,
-  "acoustic_emission_db": <predicted dB>,
-  "surface_finish_ra": <predicted Ra in microns>,
-  "recommendation": "specific maintenance or action recommendation",
-  "risk_factors": ["factor1", "factor2"],
-  "next_inspection": "when to next inspect"
-}`;
-
-      const text = await callAI(prompt);
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error('AI returned unexpected format');
+      const match = reply.match(/\{[^{}]+\}/);
+      if (!match) throw new Error('AI returned unexpected format.');
       const parsed = JSON.parse(match[0]);
       setResult(parsed);
     } catch (e) {
-      setError(`AI prediction failed: ${e.message}. Check your internet connection.`);
+      setError(e.message);
     } finally {
-      setPredicting(false);
+      setLoading(false);
     }
   }
 
-  async function handleGenerateReport(customReadings, auto = false) {
-    const readings = customReadings || getReadings();
-    if (!readings.length) {
-      setError('No sensor data available for report. Run the machine first.');
-      return;
+  function toggleLock() {
+    if (locked) {
+      // Unlock — restore live values
+      setTemp(liveTemp);
+      setVib(liveVib);
+      setCurr(liveCurr);
     }
-    setGenReport(true);
-    setReportText('');
-    try {
-      const temps  = readings.map(r => r.temperature_c).filter(Boolean);
-      const vibs   = readings.map(r => r.vibration_rms_mm_s2).filter(Boolean);
-      const currs  = readings.map(r => r.spindle_current_a).filter(Boolean);
-      const wears  = readings.map(r => r.wear_progression).filter(Boolean);
-      const avg = arr => arr.length ? (arr.reduce((a,b)=>a+b,0)/arr.length) : 0;
-      const max = arr => arr.length ? Math.max(...arr) : 0;
-      const min = arr => arr.length ? Math.min(...arr) : 0;
-
-      const prompt = `You are a broaching machine health expert. Generate a comprehensive daily report.
-
-Date: ${new Date().toLocaleDateString('en-IN', {weekday:'long', year:'numeric', month:'long', day:'numeric'})}
-Total readings analyzed: ${readings.length}
-
-Sensor Statistics:
-- Temperature: avg=${avg(temps).toFixed(1)}°C, max=${max(temps).toFixed(1)}°C, min=${min(temps).toFixed(1)}°C
-- Vibration:   avg=${avg(vibs).toFixed(3)} m/s², max=${max(vibs).toFixed(3)} m/s²
-- Current:     avg=${avg(currs).toFixed(2)}A, max=${max(currs).toFixed(2)}A
-- Wear:        start=${wears[0]?.toFixed(3)||'N/A'}, end=${wears[wears.length-1]?.toFixed(3)||'N/A'}
-
-Write a detailed daily health report with these sections:
-1. EXECUTIVE SUMMARY (2-3 sentences)
-2. MACHINE HEALTH STATUS (Good/Warning/Critical with reasoning)
-3. SENSOR ANALYSIS (what each sensor trend means)
-4. TOOL WEAR ASSESSMENT
-5. MAINTENANCE RECOMMENDATIONS (specific actions)
-6. TOMORROW'S OUTLOOK (predicted conditions)
-
-Be specific, practical and clear. Use plain language.`;
-
-      const text = await callAI(prompt);
-      const reportObj = {
-        id: Date.now(),
-        date: new Date().toISOString(),
-        dateLabel: new Date().toLocaleDateString('en-IN', {weekday:'short', month:'short', day:'numeric', year:'numeric'}),
-        readingCount: readings.length,
-        text,
-        auto,
-        avgTemp: avg(temps).toFixed(1),
-        avgVib:  avg(vibs).toFixed(3),
-        avgCurr: avg(currs).toFixed(2),
-      };
-      saveDailyReport(reportObj);
-      setReports(getDailyReports());
-      setReportText(text);
-      setExpanded(reportObj.id);
-    } catch (e) {
-      setError(`Report generation failed: ${e.message}`);
-    } finally {
-      setGenReport(false);
-    }
+    setLocked(l => !l);
   }
 
-  const statusColor = (s) => {
-    if (!s) return '#849396';
-    const sl = s.toLowerCase();
-    if (sl.includes('good') || sl.includes('safe')) return '#00e5ff';
-    if (sl.includes('warning')) return '#ffba38';
-    return '#ffb4ab';
-  };
-  const statusBg = (s) => {
-    if (!s) return 'bg-[#1c2026]';
-    const sl = s.toLowerCase();
-    if (sl.includes('good') || sl.includes('safe')) return 'bg-[#00e5ff]/10 border border-[#00e5ff]/20';
-    if (sl.includes('warning')) return 'bg-[#ffba38]/10 border border-[#ffba38]/20';
-    return 'bg-[#ffb4ab]/10 border border-[#ffb4ab]/20';
-  };
-
-  function Field({ label, value, onChange, type='text', placeholder='', readOnly=false }) {
-    return (
-      <div className="space-y-1">
-        <label className="text-[10px] uppercase tracking-[0.15em] text-[#849396]">{label}</label>
-        <input type={type} value={value} onChange={e=>onChange(e.target.value)}
-          placeholder={placeholder} readOnly={readOnly}
-          className={`w-full bg-[#10141a] border border-[#3b494c]/40 text-[#dfe2eb] text-sm rounded-lg px-3 py-2 outline-none transition-colors
-            ${readOnly ? 'text-[#00e5ff] border-[#00e5ff]/30 cursor-default' : 'focus:border-[#00daf3]/50 placeholder-[#3b494c]'}`}/>
-      </div>
-    );
-  }
-
-  function Select({ label, value, onChange, options }) {
-    return (
-      <div className="space-y-1">
-        <label className="text-[10px] uppercase tracking-[0.15em] text-[#849396]">{label}</label>
-        <select value={value} onChange={e=>onChange(e.target.value)}
-          className="w-full bg-[#10141a] border border-[#3b494c]/40 text-[#dfe2eb] text-sm rounded-lg px-3 py-2 outline-none focus:border-[#00daf3]/50">
-          {options.map(o => <option key={o} value={o}>{o}</option>)}
-        </select>
-      </div>
-    );
-  }
+  const ResultCard = ({ label, value, unit, color }) => (
+    <div className="bg-[#10141a] rounded-xl p-4 text-center border border-[#3b494c]/20">
+      <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-2">{label}</div>
+      <div className="text-2xl font-black" style={{ color }}>{value}</div>
+      {unit && <div className="text-[10px] text-[#849396] mt-1">{unit}</div>}
+    </div>
+  );
 
   return (
-    <div className="p-6 space-y-6 max-w-5xl">
+    <div className="p-6 space-y-6 max-w-4xl">
       {/* Header */}
-      <div className="flex items-center justify-between flex-wrap gap-3">
+      <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight flex items-center gap-2">
-            <Brain size={22} className="text-[#c084fc]"/> AI Tool Life Predictor
+            <Brain size={22} className="text-[#c084fc]"/> AI Predictor
           </h1>
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">NVIDIA AI · Real-time Sensor Integration · Daily Reports</div>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">NVIDIA AI · Real-time tool condition analysis</div>
         </div>
-        {/* Connection badge */}
-        <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold border
-          ${isConnected ? 'bg-[#00e5ff]/10 border-[#00e5ff]/30 text-[#00e5ff]' : 'bg-[#ffb4ab]/10 border-[#ffb4ab]/30 text-[#ffb4ab]'}`}>
-          {isConnected ? <Wifi size={12}/> : <WifiOff size={12}/>}
-          {isConnected ? 'Sensors Live' : 'Sensors Offline'}
+        <div className={`flex items-center gap-1.5 text-[10px] px-3 py-1.5 rounded-full border font-bold
+          ${isConnected ? 'text-[#00e5ff] bg-[#00e5ff]/10 border-[#00e5ff]/20' : 'text-[#ffb4ab] bg-[#ffb4ab]/10 border-[#ffb4ab]/20'}`}>
+          {isConnected ? <><Wifi size={11}/> Bridge Live</> : <><WifiOff size={11}/> Bridge Offline</>}
         </div>
       </div>
 
-      {/* Not connected warning */}
-      {!isConnected && (
-        <div className="bg-[#ffb4ab]/10 border border-[#ffb4ab]/20 rounded-xl p-4 flex items-start gap-3">
-          <AlertTriangle size={16} className="text-[#ffba38] flex-shrink-0 mt-0.5"/>
-          <div>
-            <div className="text-sm font-bold text-[#ffba38] mb-1">Sensors Not Connected</div>
-            <div className="text-xs text-[#849396] leading-relaxed">
-              AI prediction requires live sensor data. Please:
-              <ol className="mt-1.5 space-y-0.5 list-decimal list-inside">
-                <li>Connect Arduino via USB</li>
-                <li>Open Command Prompt → run: <code className="text-[#00daf3] bg-[#10141a] px-1 rounded">python sensor_bridge.py</code></li>
-                <li>Refresh this page</li>
-              </ol>
-            </div>
+      {/* Sensor Readings */}
+      <div className="bg-[#181c22] rounded-2xl p-5 border border-[#3b494c]/15">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Activity size={15} className="text-[#00e5ff]"/>
+            <span className="text-sm font-bold text-[#dfe2eb]">Sensor Readings</span>
+            {isConnected && !locked && (
+              <span className="text-[9px] bg-[#00e5ff]/10 text-[#00e5ff] border border-[#00e5ff]/20 px-2 py-0.5 rounded-full animate-pulse">● AUTO UPDATING</span>
+            )}
+            {locked && (
+              <span className="text-[9px] bg-[#ffba38]/10 text-[#ffba38] border border-[#ffba38]/20 px-2 py-0.5 rounded-full">● LOCKED FOR EDITING</span>
+            )}
           </div>
+          {/* Lock/Unlock toggle */}
+          <button onClick={toggleLock}
+            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-colors
+              ${locked
+                ? 'text-[#ffba38] border-[#ffba38]/30 bg-[#ffba38]/10 hover:bg-[#ffba38]/20'
+                : 'text-[#849396] border-[#3b494c]/30 hover:text-[#dfe2eb] hover:border-[#dfe2eb]/20'}`}>
+            {locked ? <><Unlock size={12}/> Unlock (resume live)</> : <><Lock size={12}/> Lock to edit</>}
+          </button>
         </div>
-      )}
-
-      {/* Live sensor strip */}
-      {isConnected && liveReading && (
-        <div className="bg-[#00e5ff]/5 border border-[#00e5ff]/20 rounded-xl p-3 flex flex-wrap gap-6">
-          <div className="text-[10px] uppercase tracking-widest text-[#00e5ff] font-bold self-center">● LIVE SENSORS</div>
-          {[
-            ['Temperature', liveReading.temperature_c?.toFixed(1), '°C'],
-            ['Vibration',   liveReading.vibration_rms_mm_s2?.toFixed(3), 'm/s²'],
-            ['Current',     liveReading.spindle_current_a?.toFixed(3), 'A'],
-          ].map(([l,v,u]) => (
-            <div key={l} className="flex items-baseline gap-1">
-              <span className="text-[9px] text-[#849396] uppercase tracking-wider">{l}</span>
-              <span className="text-lg font-black text-[#c3f5ff]">{v}</span>
-              <span className="text-xs text-[#849396]">{u}</span>
+        <div className="grid grid-cols-3 gap-4">
+          {[{ label:'Temperature (°C)', val:temp, set:setTemp, icon:ThermometerSun, color:'#ff9259' },
+            { label:'Vibration (m/s²)', val:vib,  set:setVib,  icon:Activity,      color:'#00e5ff' },
+            { label:'Current (A)',      val:curr,  set:setCurr, icon:Gauge,         color:'#818cf8' },
+          ].map(({ label, val, set, icon: Icon, color }) => (
+            <div key={label}>
+              <label className="block text-[10px] uppercase tracking-wider mb-1.5" style={{ color }}>
+                <Icon size={10} className="inline mr-1"/>{label}
+              </label>
+              <input
+                value={val}
+                onChange={e => { if (locked) set(e.target.value); }}
+                readOnly={!locked}
+                className={`w-full bg-[#10141a] border rounded-lg px-3 py-2.5 text-sm font-mono text-[#dfe2eb] outline-none transition-colors
+                  ${locked
+                    ? 'border-[#ffba38]/40 focus:border-[#ffba38]/70 cursor-text'
+                    : 'border-[#3b494c]/30 cursor-default opacity-80'}`}
+              />
             </div>
           ))}
-          <div className="text-[9px] text-[#849396] self-center ml-auto">
-            Auto-filled below ↓
-          </div>
+        </div>
+        <div className="mt-2 text-[10px] text-[#849396]">
+          {locked
+            ? '✏️ You can now edit values manually. Click Unlock to resume live updates.'
+            : '🔄 Values auto-update from Arduino. Click Lock to edit manually.'}
+        </div>
+      </div>
+
+      {/* Cutting Parameters */}
+      <div className="bg-[#181c22] rounded-2xl p-5 border border-[#3b494c]/15">
+        <div className="flex items-center gap-2 mb-4">
+          <Zap size={15} className="text-[#ffba38]"/>
+          <span className="text-sm font-bold text-[#dfe2eb]">Cutting Parameters</span>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+          {[
+            { label:'Spindle Speed (RPM)',   val:speed,    set:setSpeed,    ph:'e.g. 100' },
+            { label:'Feed Rate (mm/rev)',    val:feed,     set:setFeed,     ph:'e.g. 0.15' },
+            { label:'Depth of Cut (mm)',     val:depth,    set:setDepth,    ph:'e.g. 2.0' },
+            { label:'Coolant Flow (L/min)',  val:coolant,  set:setCoolant,  ph:'e.g. 18' },
+            { label:'Hardness (HB)',         val:hardness, set:setHardness, ph:'e.g. 200' },
+          ].map(({ label, val, set, ph }) => (
+            <div key={label}>
+              <label className="block text-[10px] uppercase tracking-wider text-[#849396] mb-1.5">{label}</label>
+              <input value={val} onChange={e => set(e.target.value)} placeholder={ph}
+                className="w-full bg-[#10141a] border border-[#3b494c]/30 rounded-lg px-3 py-2.5 text-sm text-[#dfe2eb] outline-none focus:border-[#c084fc]/50 placeholder-[#3b494c]"/>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Predict Button */}
+      <button onClick={predict} disabled={loading || !isConnected}
+        className="w-full py-4 rounded-2xl font-black text-base tracking-wide transition-all
+          bg-gradient-to-r from-[#7c3aed] to-[#c084fc] hover:from-[#6d28d9] hover:to-[#a855f7]
+          disabled:from-[#3b494c]/30 disabled:to-[#3b494c]/30 disabled:text-[#849396]
+          text-white flex items-center justify-center gap-2 shadow-lg shadow-[#c084fc]/10">
+        {loading
+          ? <><RefreshCw size={18} className="animate-spin"/> Analysing with AI...</>
+          : !isConnected
+          ? <><WifiOff size={18}/> Start sensor_bridge.py to enable AI</>
+          : <><Brain size={18}/> Predict Tool Status</>}
+      </button>
+
+      {/* Error */}
+      {error && (
+        <div className="bg-[#ffb4ab]/10 border border-[#ffb4ab]/20 rounded-xl px-4 py-3 text-sm text-[#ffb4ab] flex items-center gap-2">
+          ⚠️ {error}
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Left: Form */}
-        <div className="space-y-5">
-          {/* Tool Info */}
-          <div className="bg-[#181c22] rounded-xl p-5 space-y-4">
-            <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Tool Information</div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Tool ID" value={form.toolId} onChange={v=>update('toolId',v)}/>
-              <Select label="Tool Material" value={form.toolMaterial} onChange={v=>update('toolMaterial',v)}
-                options={['Carbide','HSS','Cobalt HSS','Cermet','CBN']}/>
-              <Select label="Coating" value={form.coating} onChange={v=>update('coating',v)}
-                options={['TiN','TiCN','TiAlN','DLC','Uncoated']}/>
-              <Select label="Workpiece Material" value={form.workpiece} onChange={v=>update('workpiece',v)}
-                options={['Steel','Stainless Steel','Cast Iron','Aluminum','Titanium']}/>
-              <Field label="Tool Age (hours)" value={form.toolAge} onChange={v=>update('toolAge',v)} placeholder="e.g. 150"/>
-              <Field label="Cycles Completed" value={form.cyclesCompleted} onChange={v=>update('cyclesCompleted',v)} placeholder="e.g. 4500"/>
-            </div>
-          </div>
-
-          {/* Cutting Parameters */}
-          <div className="bg-[#181c22] rounded-xl p-5 space-y-4">
-            <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Cutting Parameters</div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Spindle Speed (RPM)" value={form.spindleSpeed} onChange={v=>update('spindleSpeed',v)} placeholder="e.g. 1200"/>
-              <Field label="Feed Rate (mm/rev)" value={form.feedRate} onChange={v=>update('feedRate',v)} placeholder="e.g. 0.15"/>
-              <Field label="Depth of Cut (mm)" value={form.depthOfCut} onChange={v=>update('depthOfCut',v)}/>
-              <Field label="Coolant Flow (L/min)" value={form.coolantFlow} onChange={v=>update('coolantFlow',v)}/>
-              <Field label="Hardness (HB)" value={form.hardness} onChange={v=>update('hardness',v)}/>
-            </div>
-          </div>
-
-          {/* Sensor Readings */}
-          <div className="bg-[#181c22] rounded-xl p-5 space-y-4">
+      {/* Result */}
+      {result && (
+        <div className="space-y-4">
+          <div className="bg-[#181c22] rounded-2xl p-5 border-2 space-y-4"
+            style={{ borderColor: statusColor(result.tool_status) + '40' }}>
+            {/* Status banner */}
             <div className="flex items-center justify-between">
-              <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Sensor Readings</div>
-              {isConnected && <span className="text-[9px] text-[#00e5ff] uppercase tracking-wider">● Auto-updating</span>}
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Temperature (°C)" value={form.temperature} onChange={v=>update('temperature',v)}
-                placeholder="waiting..." readOnly={isConnected}/>
-              <Field label="Vibration (m/s²)" value={form.vibration} onChange={v=>update('vibration',v)}
-                placeholder="waiting..." readOnly={isConnected}/>
-              <Field label="Current (A)" value={form.current} onChange={v=>update('current',v)}
-                placeholder="waiting..." readOnly={isConnected}/>
-            </div>
-            {!isConnected && (
-              <p className="text-[10px] text-[#849396]">You can enter values manually while sensors are offline for a test prediction.</p>
-            )}
-          </div>
-
-          {/* Predict button */}
-          <button onClick={handlePredict} disabled={predicting}
-            className={`w-full flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-bold transition-all
-              ${predicting
-                ? 'bg-[#c084fc]/20 text-[#c084fc] cursor-wait'
-                : isConnected
-                  ? 'bg-gradient-to-r from-[#c084fc] to-[#818cf8] text-white hover:opacity-90 shadow-lg shadow-[#c084fc]/20'
-                  : 'bg-[#3b494c]/30 text-[#849396] hover:bg-[#ffb4ab]/10 hover:text-[#ffb4ab]'
-              }`}>
-            {predicting
-              ? <><RefreshCw size={16} className="animate-spin"/> Analyzing with AI...</>
-              : <><Brain size={16}/> Predict Tool Status</>
-            }
-          </button>
-
-          {/* Error */}
-          {error && (
-            <div className="bg-[#ffb4ab]/10 border border-[#ffb4ab]/20 rounded-xl p-3 flex items-start gap-2">
-              <XCircle size={14} className="text-[#ffb4ab] flex-shrink-0 mt-0.5"/>
-              <p className="text-xs text-[#ffb4ab]">{error}</p>
-            </div>
-          )}
-        </div>
-
-        {/* Right: Result + Reports */}
-        <div className="space-y-5">
-          {/* Prediction Result */}
-          {result ? (
-            <div className={`rounded-xl p-5 space-y-4 ${statusBg(result.status)}`}>
-              <div className="flex items-center justify-between">
-                <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">AI Prediction Result</div>
-                {result.status?.toLowerCase().includes('good') || result.status?.toLowerCase().includes('safe')
-                  ? <CheckCircle size={18} style={{color: statusColor(result.status)}}/>
-                  : <AlertTriangle size={18} style={{color: statusColor(result.status)}}/>}
-              </div>
-
-              {/* Big status */}
-              <div className="text-center py-3">
-                <div className="text-3xl font-black font-headline" style={{color: statusColor(result.status)}}>
-                  {result.status}
-                </div>
-                <div className="text-sm text-[#849396] mt-1">{result.condition}</div>
-              </div>
-
-              {/* Wear + Life */}
-              <div className="grid grid-cols-2 gap-3">
-                <div className="bg-[#10141a]/60 rounded-lg p-3 text-center">
-                  <div className="text-[9px] uppercase tracking-wider text-[#849396]">Wear</div>
-                  <div className="text-2xl font-black text-[#ffba38]">{result.wear_percent}%</div>
-                </div>
-                <div className="bg-[#10141a]/60 rounded-lg p-3 text-center">
-                  <div className="text-[9px] uppercase tracking-wider text-[#849396]">Life Remaining</div>
-                  <div className="text-xl font-black text-[#c3f5ff]">{result.remaining_life_hours}h</div>
-                  <div className="text-[9px] text-[#849396]">{result.remaining_cycles} cycles</div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[#849396] mb-1">Tool Status</div>
+                <div className="text-3xl font-black uppercase" style={{ color: statusColor(result.tool_status) }}>
+                  {result.tool_status}
                 </div>
               </div>
-
-              {/* Predicted params */}
-              <div className="grid grid-cols-3 gap-2">
-                {[
-                  ['Force', result.cutting_force_n, 'N'],
-                  ['Acoustic', result.acoustic_emission_db, 'dB'],
-                  ['Surface Ra', result.surface_finish_ra, 'μm'],
-                ].map(([l,v,u]) => (
-                  <div key={l} className="bg-[#10141a]/60 rounded-lg p-2 text-center">
-                    <div className="text-[9px] uppercase tracking-wider text-[#849396]">{l}</div>
-                    <div className="text-sm font-bold text-[#dfe2eb]">{v} <span className="text-[9px] text-[#849396]">{u}</span></div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Recommendation */}
-              <div className="bg-[#10141a]/60 rounded-lg p-3">
-                <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">Recommendation</div>
-                <p className="text-xs text-[#dfe2eb] leading-relaxed">{result.recommendation}</p>
-              </div>
-
-              {/* Risk factors */}
-              {result.risk_factors?.length > 0 && (
-                <div>
-                  <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-2">Risk Factors</div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {result.risk_factors.map((r,i) => (
-                      <span key={i} className="text-[10px] bg-[#ffba38]/10 text-[#ffba38] border border-[#ffba38]/20 px-2 py-0.5 rounded-full">{r}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <div className="text-[9px] text-[#849396] flex items-center gap-1">
-                <Clock size={10}/> Next inspection: {result.next_inspection}
+              <div className="text-right">
+                <div className="text-[10px] uppercase tracking-wider text-[#849396] mb-1">AI Confidence</div>
+                <div className="text-3xl font-black text-[#dfe2eb]">{result.confidence}%</div>
               </div>
             </div>
-          ) : (
-            <div className="bg-[#181c22] rounded-xl p-8 flex flex-col items-center justify-center text-center gap-3">
-              <Brain size={40} className="text-[#3b494c]"/>
-              <div className="text-sm text-[#849396]">Fill in tool details and click<br/>"Predict Tool Status" to get AI analysis</div>
-              {!isConnected && <div className="text-xs text-[#ffba38]">⚠ Connect sensors first for live data</div>}
-            </div>
-          )}
 
-          {/* Daily Reports */}
-          <div className="bg-[#181c22] rounded-xl p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Daily Reports</div>
-              <button onClick={() => handleGenerateReport()} disabled={genReport}
-                className="flex items-center gap-1.5 text-xs text-[#00daf3] hover:text-[#c3f5ff] border border-[#00daf3]/30 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50">
-                {genReport ? <RefreshCw size={11} className="animate-spin"/> : <Download size={11}/>}
-                {genReport ? 'Generating...' : 'Generate Now'}
-              </button>
-            </div>
-
-            <p className="text-[10px] text-[#849396]">Reports auto-generate daily at 11 PM. Click "Generate Now" anytime.</p>
-
-            {reports.length === 0 ? (
-              <div className="text-center py-6 text-xs text-[#849396]">
-                No reports yet. Run the machine and click "Generate Now".
+            {/* Remaining life bar */}
+            <div>
+              <div className="flex justify-between text-[10px] text-[#849396] mb-1.5">
+                <span>Remaining Tool Life</span>
+                <span className="font-bold text-[#dfe2eb]">{result.remaining_life_percent}%</span>
               </div>
-            ) : (
-              <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
-                {reports.map(r => (
-                  <div key={r.id} className="bg-[#10141a] rounded-lg border border-[#3b494c]/20">
-                    <button onClick={() => setExpanded(expanded===r.id ? null : r.id)}
-                      className="w-full flex items-center justify-between p-3 text-left">
-                      <div>
-                        <div className="text-xs font-bold text-[#dfe2eb]">{r.dateLabel}</div>
-                        <div className="text-[9px] text-[#849396] mt-0.5">
-                          {r.readingCount} readings · T:{r.avgTemp}°C · V:{r.avgVib} · I:{r.avgCurr}A
-                          {r.auto && <span className="ml-2 text-[#00e5ff]">● auto</span>}
-                        </div>
-                      </div>
-                      {expanded===r.id ? <ChevronUp size={14} className="text-[#849396]"/> : <ChevronDown size={14} className="text-[#849396]"/>}
-                    </button>
-                    {expanded===r.id && (
-                      <div className="px-3 pb-3">
-                        <div className="text-[11px] text-[#c3f5ff] leading-relaxed whitespace-pre-wrap border-t border-[#3b494c]/20 pt-3">
-                          {r.text}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
+              <div className="h-2.5 bg-[#10141a] rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all duration-700"
+                  style={{
+                    width: `${result.remaining_life_percent}%`,
+                    background: result.remaining_life_percent > 60 ? '#00e5ff'
+                              : result.remaining_life_percent > 30 ? '#ffba38' : '#ffb4ab'
+                  }}/>
+              </div>
+            </div>
+
+            {/* Metrics grid */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <ResultCard label="Wear Progress" value={Number(result.wear_progression).toFixed(3)} unit="mm" color="#ffba38"/>
+              <ResultCard label="Cutting Force" value={Math.round(result.cutting_force_n)} unit="N" color="#34d399"/>
+              <ResultCard label="Acoustic" value={Number(result.acoustic_emission_db).toFixed(1)} unit="dB" color="#818cf8"/>
+              <ResultCard label="Surface Ra" value={Number(result.surface_finish_ra_um).toFixed(2)} unit="μm" color="#c084fc"/>
+            </div>
+
+            {/* Recommendation */}
+            {result.recommendation && (
+              <div className="bg-[#10141a] rounded-xl px-4 py-3 text-sm text-[#dfe2eb] border border-[#3b494c]/20">
+                <span className="text-[#c084fc] font-bold">Recommendation: </span>{result.recommendation}
               </div>
             )}
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
