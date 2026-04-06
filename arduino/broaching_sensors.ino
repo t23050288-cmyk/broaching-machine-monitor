@@ -1,8 +1,11 @@
 /*
-  Broaching Machine Sensor Sketch v2
+  Broaching Machine Sensor Sketch v3.0
   ====================================
-  Reads DHT11 (temperature), MPU6050 (vibration), ACS712 (current)
-  Uses RMS averaging for accurate vibration + current readings.
+  Fixes:
+  - DHT11 timeout guard (was freezing the loop)
+  - Non-blocking millis() timing instead of delay()
+  - Watchdog timer to auto-reset if Arduino hangs
+  - Retry logic for DHT11 read failures
 
   Wiring:
     DHT11  DATA pin  -> Arduino pin 2
@@ -22,6 +25,7 @@
   Output: TEMP:25.30,VIB:2.45,CURR:1.20
 */
 
+#include <avr/wdt.h>      // Watchdog timer
 #include <DHT.h>
 #include <Wire.h>
 #include <MPU6050.h>
@@ -29,74 +33,64 @@
 #define DHT_PIN          2
 #define DHT_TYPE         DHT11
 #define ACS_PIN          A0
-
-// ---- ACS712 settings ----------------------------------------
-// Change ACS_SENSITIVITY based on your module:
-//   ACS712-05B = 185.0   (5A  version)
-//   ACS712-20A = 100.0   (20A version)  <-- most common
-//   ACS712-30A =  66.0   (30A version)
-#define ACS_SENSITIVITY  100.0   // mV/A  -- change if needed
-#define VIB_SAMPLES      128     // samples for RMS vibration
-#define CURR_SAMPLES     200     // samples for stable current
+#define ACS_SENSITIVITY  100.0
+#define VIB_SAMPLES      64
+#define CURR_SAMPLES     150
+#define SEND_INTERVAL    1000  // ms between readings
 
 DHT dht(DHT_PIN, DHT_TYPE);
 MPU6050 mpu;
 
-// Store baseline vibration (measured at startup with machine off)
 float vib_baseline_x = 0, vib_baseline_y = 0, vib_baseline_z = 0;
+float lastGoodTemp = 25.0;   // remember last valid temperature
+unsigned long lastSendTime = 0;
 
 void calibrateVibration() {
-  // Take 200 samples at rest to find baseline offset
   long sx = 0, sy = 0, sz = 0;
-  for (int i = 0; i < 200; i++) {
+  for (int i = 0; i < 100; i++) {
     int16_t ax, ay, az, gx, gy, gz;
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
     sx += ax; sy += ay; sz += az;
     delay(5);
+    wdt_reset(); // keep watchdog happy during calibration
   }
-  vib_baseline_x = sx / 200.0;
-  vib_baseline_y = sy / 200.0;
-  vib_baseline_z = sz / 200.0;
+  vib_baseline_x = sx / 100.0;
+  vib_baseline_y = sy / 100.0;
+  vib_baseline_z = sz / 100.0;
 }
 
-void setup() {
-  Serial.begin(9600);
-  dht.begin();
-  Wire.begin();
-  mpu.initialize();
-  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2); // +-2g range
-  if (!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed!");
+float readTemperatureSafe() {
+  // Try up to 3 times with a short delay
+  for (int attempt = 0; attempt < 3; attempt++) {
+    float t = dht.readTemperature();
+    if (!isnan(t) && t > -10.0 && t < 120.0) {
+      lastGoodTemp = t;  // save last valid reading
+      return t;
+    }
+    delay(50); // short wait before retry
+    wdt_reset();
   }
-  delay(2000);
-  calibrateVibration(); // calibrate once at startup
+  // All attempts failed — return last known good value
+  return lastGoodTemp;
 }
 
-void loop() {
-  // ---- 1. Temperature (DHT11) ---------------------------------
-  float temp = dht.readTemperature();
-  if (isnan(temp)) temp = 25.0; // fallback
-
-  // ---- 2. Vibration RMS (MPU6050) ----------------------------
-  // Collect VIB_SAMPLES, subtract baseline, compute RMS magnitude
+float readVibration() {
   float sum_sq = 0;
   for (int i = 0; i < VIB_SAMPLES; i++) {
     int16_t ax, ay, az, gx, gy, gz;
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    // Remove baseline offset
-    float dx = (ax - vib_baseline_x) / 16384.0; // in g
+    float dx = (ax - vib_baseline_x) / 16384.0;
     float dy = (ay - vib_baseline_y) / 16384.0;
     float dz = (az - vib_baseline_z) / 16384.0;
-    // Magnitude squared (ignore gravity — already subtracted in baseline)
     sum_sq += dx*dx + dy*dy + dz*dz;
-    delayMicroseconds(500); // ~2kHz sampling
+    delayMicroseconds(500);
   }
-  float vib_g_rms = sqrt(sum_sq / VIB_SAMPLES); // g RMS
-  float vib = vib_g_rms * 9.806; // convert to m/s2, display as reasonable units
-  if (vib < 0.01) vib = 0.01; // floor
+  float vib_g_rms = sqrt(sum_sq / VIB_SAMPLES);
+  float vib = vib_g_rms * 9.806;
+  return max(vib, 0.01f);
+}
 
-  // ---- 3. Current RMS (ACS712) --------------------------------
-  // Read many samples, find midpoint (zero-current offset), compute RMS
+float readCurrent() {
   long sum = 0;
   int readings[CURR_SAMPLES];
   for (int i = 0; i < CURR_SAMPLES; i++) {
@@ -104,23 +98,59 @@ void loop() {
     sum += readings[i];
     delayMicroseconds(200);
   }
-  float midpoint = sum / (float)CURR_SAMPLES; // dynamic zero offset
+  float midpoint = sum / (float)CURR_SAMPLES;
   float curr_sum_sq = 0;
   for (int i = 0; i < CURR_SAMPLES; i++) {
-    float v = ((readings[i] - midpoint) / 1023.0) * 5000.0; // mV deviation
+    float v = ((readings[i] - midpoint) / 1023.0) * 5000.0;
     float a = v / ACS_SENSITIVITY;
     curr_sum_sq += a * a;
   }
-  float current = sqrt(curr_sum_sq / CURR_SAMPLES); // RMS current in Amps
-  if (current < 0.05) current = 0.0; // noise floor
+  float current = sqrt(curr_sum_sq / CURR_SAMPLES);
+  return (current < 0.05) ? 0.0 : current;
+}
 
-  // ---- 4. Send over Serial ------------------------------------
+void setup() {
+  // Enable watchdog — resets Arduino if it hangs for more than 8 seconds
+  wdt_enable(WDTO_8S);
+
+  Serial.begin(9600);
+  dht.begin();
+  Wire.begin();
+  Wire.setClock(100000); // slow I2C to 100kHz — more stable
+  mpu.initialize();
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed!");
+  }
+
+  wdt_reset();
+  delay(2000);
+  wdt_reset();
+  calibrateVibration();
+  wdt_reset();
+
+  Serial.println("READY");
+}
+
+void loop() {
+  wdt_reset(); // reset watchdog every loop — if this stops, Arduino reboots
+
+  unsigned long now = millis();
+  if (now - lastSendTime < SEND_INTERVAL) return; // non-blocking wait
+  lastSendTime = now;
+
+  float temp    = readTemperatureSafe();
+  wdt_reset();
+  float vib     = readVibration();
+  wdt_reset();
+  float current = readCurrent();
+  wdt_reset();
+
   Serial.print("TEMP:");
   Serial.print(temp, 2);
   Serial.print(",VIB:");
   Serial.print(vib, 3);
   Serial.print(",CURR:");
   Serial.println(current, 3);
-
-  delay(800); // ~1 reading per second
 }
