@@ -1,15 +1,19 @@
 /**
- * sensorBridge.js
+ * sensorBridge.js v2.0
  * Manages the WebSocket connection to sensor_bridge.py (localhost:8765)
- * Handles both sensor readings and AI chat messages.
+ * 
+ * FIX: Bridge sends readings as raw JSON objects (no type wrapper).
+ * Now handles BOTH formats:
+ *   - {type: 'reading', data: {...}}   (wrapped format)
+ *   - {timestamp, temperature_c, ...}  (raw format — what bridge actually sends)
  */
 
 const WS_URL = 'ws://localhost:8765';
 
-let ws            = null;
-let status        = 'disconnected';
+let ws             = null;
+let status         = 'disconnected';
 let reconnectTimer = null;
-const listeners   = new Set();
+const listeners    = new Set();
 const chatListeners = new Set();
 
 export function getBridgeStatus() {
@@ -54,12 +58,39 @@ export function connectBridge() {
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
+
+      // Handle chat replies
       if (msg.type === 'chat_reply') {
         notifyChat(msg.reply);
-      } else {
-        notifyAll(msg);
-        if (msg.type === 'status') status = msg.status;
+        return;
       }
+
+      // Handle status messages
+      if (msg.type === 'status') {
+        status = msg.status;
+        notifyAll(msg);
+        return;
+      }
+
+      // Handle pong
+      if (msg.type === 'pong') return;
+
+      // Handle wrapped reading format: {type: 'reading', data: {...}}
+      if (msg.type === 'reading' && msg.data) {
+        notifyAll({ type: 'reading', data: msg.data });
+        return;
+      }
+
+      // Handle raw reading format (bridge sends directly):
+      // {timestamp, temperature_c, vibration_rms_mm_s2, spindle_current_a, ...}
+      if (msg.timestamp && (msg.temperature_c !== undefined || msg.spindle_current_a !== undefined)) {
+        notifyAll({ type: 'reading', data: msg });
+        return;
+      }
+
+      // Fallback — pass through as-is
+      notifyAll(msg);
+
     } catch (e) {
       console.warn('Bridge parse error:', e);
     }
