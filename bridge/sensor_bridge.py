@@ -1,157 +1,187 @@
 #!/usr/bin/env python3
 """
-Broaching Machine Sensor Bridge v5.2
-- Fixed: tool status flickering (3-reading stability filter)
-- Fixed: smooth sensor averaging (rolling window)
-- COM7, websockets compat fix
+Broaching Machine Sensor Bridge v5.0
+- Kalman filter on all 3 sensor channels
+- FFT vibration frequency analysis (dominant frequency)
+- Remaining life / time estimate
+- MQTT export (optional)
+- Built-in WebSocket ping/pong keepalive
 
-INSTALL: pip install pyserial websockets openai
-RUN:     python sensor_bridge.py
+INSTALL: pip install pyserial websockets requests
+OPTIONAL MQTT: pip install paho-mqtt
+RUN: python sensor_bridge.py
 """
 
-import asyncio, json, re, logging, sys
+import asyncio, json, re, logging, sys, math
 from datetime import datetime
 from collections import deque
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-HOST         = 'localhost'
+HOST         = '0.0.0.0'
 WS_PORT      = 8765
 BAUD         = 9600
 ARDUINO_PORT = 'COM7'
 
-NVIDIA_API_KEY  = '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'
-NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
-AI_MODEL        = 'meta/llama-3.1-8b-instruct'
+# ── MQTT config (optional) ─────────────────────────────────────
+MQTT_ENABLED = False        # set True to enable
+MQTT_BROKER  = 'localhost'
+MQTT_PORT    = 1883
+MQTT_TOPIC   = 'broaching/sensors'
+# ──────────────────────────────────────────────────────────────
 
-# Stability: status only changes after this many consecutive same readings
-STATUS_CONFIRM = 3
+THRESHOLDS = {
+    'temperature_c':       {'warn': 82, 'error': 88},
+    'vibration_rms_mm_s2': {'warn': 28, 'error': 33},
+    'spindle_current_a':   {'warn': 41, 'error': 44},
+}
 
-CHAT_SYSTEM = """You are KineticAI, an expert assistant for broaching machine monitoring and tool life management.
-You have deep knowledge of broaching machine operations, tool wear, sensor data interpretation,
-cutting parameters, coolant systems, coatings, and safety protocols.
-Be concise, practical, and helpful."""
+# Tool life model — typical carbide broach tool life
+TOOL_MAX_CYCLES    = 5000    # max cycles before replacement
+READINGS_PER_CYCLE = 1       # 1 reading ≈ 1 cutting cycle
+
 
 try:
     import serial
 except ImportError:
-    log.error('Run: pip install pyserial'); sys.exit(1)
+    log.error('pyserial not installed. Run: pip install pyserial'); sys.exit(1)
 
 try:
+    import websockets
     from websockets.asyncio.server import serve as ws_serve
-    NEW_WS = True
 except ImportError:
+    log.error('websockets not installed. Run: pip install websockets'); sys.exit(1)
+
+mqtt_client = None
+if MQTT_ENABLED:
     try:
-        import websockets
-        NEW_WS = False
-    except ImportError:
-        log.error('Run: pip install websockets'); sys.exit(1)
-
-try:
-    from openai import OpenAI
-    ai_client    = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
-    AI_AVAILABLE = True
-    log.info('AI enabled via NVIDIA API')
-except ImportError:
-    AI_AVAILABLE = False
-    log.warning('openai not installed - run: pip install openai')
-
-# ---------- Shared state --------------------------------------------------
-connected       = set()
-latest_data     = None
-reading_history = []
-
-# Rolling window for smoothing raw sensor values (last 5 readings)
-temp_buf = deque(maxlen=5)
-vib_buf  = deque(maxlen=5)
-curr_buf = deque(maxlen=5)
-
-# Stability filter for tool status
-status_candidates = deque(maxlen=STATUS_CONFIRM)
-stable_status     = 'new'
-
-def smooth(buf, val):
-    buf.append(val)
-    return sum(buf) / len(buf)
-
-def stabilize_status(new_status):
-    """Only accept a status change if STATUS_CONFIRM readings agree."""
-    global stable_status
-    status_candidates.append(new_status)
-    if len(status_candidates) == STATUS_CONFIRM and len(set(status_candidates)) == 1:
-        stable_status = new_status
-    return stable_status
-
-# ---------- Physics fallback ----------------------------------------------
-def physics_derive(temp, vib, curr):
-    force   = max(2500, min(11500, curr*240 + vib*15 + (temp-25)*50))
-    ae      = max(300,  min(650,   curr*12  + vib*2.5 + 200))
-    wear    = min(1.5,  max(0,     (vib - 0.5) / 8.0 * 1.5))
-    surface = 0.5 if vib < 2.5 else (0.8 if vib < 5 else 1.2)
-    if   vib > 8.0 or temp > 88 or curr > 44: raw_status = 'failed'
-    elif vib > 5.0 or temp > 82 or curr > 41: raw_status = 'worn'
-    else:                                       raw_status = 'new'
-    status = stabilize_status(raw_status)
-    return {
-        'cutting_force_n':      round(force, 1),
-        'acoustic_emission_db': round(ae, 1),
-        'surface_finish_ra_um': surface,
-        'wear_progression':     round(wear, 4),
-        'tool_status':          status,
-        'spindle_speed_mmin':   round(15 + (curr - 5)*0.5, 1),
-        'feed_rate_mmtooth':    round(0.065 + (temp - 25)*0.001, 4),
-        'coolant_flow_lmin':    round(18 + (temp - 25)*0.2, 1),
-        'prediction_source':    'physics',
-    }
-
-def ai_derive(temp, vib, curr):
-    if not AI_AVAILABLE:
-        return physics_derive(temp, vib, curr)
-    try:
-        prompt = f"""You are an expert in broaching machine tool monitoring.
-Live sensor readings:
-- Temperature: {temp:.2f} C
-- Vibration RMS: {vib:.3f} m/s2
-- Spindle Current: {curr:.3f} A
-
-IMPORTANT: Current below 1A means machine is IDLE (no cutting). Predict realistically.
-Respond ONLY with valid JSON:
-{{"cutting_force_n":<number 2500-11500>,"acoustic_emission_db":<number 300-650>,"surface_finish_ra_um":<number 0.2-2.0>,"wear_progression":<number 0.0-1.5>,"tool_status":"new" or "worn" or "failed","spindle_speed_mmin":<number 10-30>,"feed_rate_mmtooth":<number 0.04-0.12>,"coolant_flow_lmin":<number 15-25>}}"""
-        resp = ai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[{'role':'user','content':prompt}],
-            temperature=0.1, max_tokens=300, stream=False
-        )
-        text = resp.choices[0].message.content.strip()
-        m = re.search(r'\{[^{}]+\}', text, re.DOTALL)
-        if m:
-            result = json.loads(m.group())
-            # Apply stability filter to AI status too
-            result['tool_status']      = stabilize_status(result.get('tool_status', 'new'))
-            result['prediction_source'] = 'ai'
-            return result
+        import paho.mqtt.client as mqtt
+        mqtt_client = mqtt.Client()
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+        log.info(f'MQTT connected to {MQTT_BROKER}:{MQTT_PORT}')
     except Exception as e:
-        log.warning(f'AI derive failed: {e}')
-    return physics_derive(temp, vib, curr)
+        log.warning(f'MQTT not available: {e}')
+        mqtt_client = None
 
-def ai_chat(messages, sensor_context=''):
-    if not AI_AVAILABLE:
-        return 'AI not available. Run: pip install openai'
-    try:
-        system = CHAT_SYSTEM
-        if sensor_context:
-            system += f'\n\nCurrent live sensor readings:\n{sensor_context}'
-        resp = ai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[{'role':'system','content':system}] + messages,
-            temperature=0.4, max_tokens=500, stream=False
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f'AI error: {e}'
 
-# ---------- Serial parsing ------------------------------------------------
+# ── Kalman Filter ─────────────────────────────────────────────
+class KalmanFilter:
+    """Simple 1D Kalman filter to smooth noisy sensor readings."""
+    def __init__(self, process_var=1e-3, measure_var=0.1):
+        self.q = process_var   # process noise
+        self.r = measure_var   # measurement noise
+        self.x = None          # state estimate
+        self.p = 1.0           # error covariance
+
+    def update(self, measurement):
+        if self.x is None:
+            self.x = measurement
+            return measurement
+        # Predict
+        self.p += self.q
+        # Update
+        k = self.p / (self.p + self.r)
+        self.x = self.x + k * (measurement - self.x)
+        self.p = (1 - k) * self.p
+        return round(self.x, 4)
+
+
+# ── FFT for dominant vibration frequency ─────────────────────
+class FFTAnalyzer:
+    """Collect raw vibration samples and compute dominant frequency."""
+    def __init__(self, window=64, sample_rate=1.0):
+        self.window      = window
+        self.sample_rate = sample_rate   # Hz (1 reading/sec from Arduino)
+        self.buffer      = deque(maxlen=window)
+
+    def add(self, value):
+        self.buffer.append(value)
+
+    def dominant_frequency(self):
+        if len(self.buffer) < self.window:
+            return None
+        n    = self.window
+        vals = list(self.buffer)
+        mean = sum(vals) / n
+        # Remove DC offset
+        vals = [v - mean for v in vals]
+        # Manual DFT (magnitudes only, up to Nyquist)
+        freqs = []
+        for k in range(1, n // 2):
+            re_part = sum(vals[i] * math.cos(2*math.pi*k*i/n) for i in range(n))
+            im_part = sum(vals[i] * math.sin(2*math.pi*k*i/n) for i in range(n))
+            mag = math.sqrt(re_part**2 + im_part**2)
+            freq = k * self.sample_rate / n
+            freqs.append((freq, mag))
+        if not freqs: return None
+        dom = max(freqs, key=lambda x: x[1])
+        return round(dom[0], 4)
+
+
+# ── Remaining Life Model ──────────────────────────────────────
+class RemainingLifeEstimator:
+    """
+    Estimates remaining tool life based on cumulative wear.
+    Uses wear_progression (0–1.5) as proxy for damage accumulation.
+    """
+    def __init__(self):
+        self.cumulative_damage = 0.0
+        self.cycle_count       = 0
+        self.history           = deque(maxlen=60)   # last 60 readings for trend
+
+    def update(self, wear, status):
+        damage_per_cycle = {
+            'new':    0.01,
+            'worn':   0.05,
+            'failed': 0.20,
+        }.get(status, 0.02)
+        self.cumulative_damage = min(100.0, self.cumulative_damage + damage_per_cycle)
+        self.cycle_count      += 1
+        self.history.append(damage_per_cycle)
+        return self._estimate()
+
+    def _estimate(self):
+        remaining_pct  = max(0.0, 100.0 - self.cumulative_damage)
+        # Avg damage rate over last 60 readings
+        if len(self.history) >= 5:
+            avg_rate = sum(self.history) / len(self.history)
+        else:
+            avg_rate = 0.02
+        if avg_rate <= 0:
+            cycles_left = TOOL_MAX_CYCLES
+        else:
+            cycles_left = int(remaining_pct / avg_rate)
+        # Time estimate: 1 reading ≈ 1 sec cycle time
+        seconds_left = cycles_left
+        hours   = seconds_left // 3600
+        minutes = (seconds_left % 3600) // 60
+        if hours > 0:
+            time_str = f'{hours}h {minutes}m'
+        else:
+            time_str = f'{minutes}m'
+        return {
+            'remaining_life_pct':    round(remaining_pct, 1),
+            'cycles_remaining':      cycles_left,
+            'estimated_time_left':   time_str,
+            'cumulative_damage_pct': round(self.cumulative_damage, 2),
+            'cycle_count':           self.cycle_count,
+        }
+
+
+# ── Global state ──────────────────────────────────────────────
+connected    = set()
+latest_reading = None
+
+kalman_temp = KalmanFilter(process_var=0.01, measure_var=0.5)
+kalman_vib  = KalmanFilter(process_var=0.05, measure_var=1.0)
+kalman_curr = KalmanFilter(process_var=0.01, measure_var=0.3)
+
+fft_analyzer = FFTAnalyzer(window=32, sample_rate=1.0)
+life_estimator = RemainingLifeEstimator()
+
+
 def parse_line(line):
     line = line.strip()
     if not line: return None
@@ -164,70 +194,101 @@ def parse_line(line):
         parts = [p.strip() for p in line.split(',')]
         if len(parts) >= 3:
             return float(parts[0]), float(parts[1]), float(parts[2])
-    except:
-        pass
+    except Exception as e:
+        log.debug(f'Parse error: {e}')
     return None
 
-# ---------- WebSocket broadcast -------------------------------------------
+
+def multi_sensor_status(temp, vib, curr):
+    """
+    Only triggers FAILED/WORN if at least 2 sensors are in alert range.
+    Prevents false alarms from a single noisy sensor.
+    """
+    failed_count = 0
+    warn_count   = 0
+    if temp > THRESHOLDS['temperature_c']['error']:       failed_count += 1
+    elif temp > THRESHOLDS['temperature_c']['warn']:      warn_count   += 1
+    if vib  > THRESHOLDS['vibration_rms_mm_s2']['error']: failed_count += 1
+    elif vib > THRESHOLDS['vibration_rms_mm_s2']['warn']: warn_count   += 1
+    if curr > THRESHOLDS['spindle_current_a']['error']:   failed_count += 1
+    elif curr > THRESHOLDS['spindle_current_a']['warn']:  warn_count   += 1
+
+    if failed_count >= 2: return 'failed'
+    if warn_count   >= 2: return 'worn'
+    if failed_count == 1: return 'worn'    # 1 critical = worn, not failed
+    return 'new'
+
+
+def derive(temp, vib, curr, status):
+    force = max(2500, min(11500, curr*240 + vib*15 + (temp-77)*50))
+    ae    = max(300,  min(650,   curr*12  + vib*2.5 + 200))
+    wear  = min(1.5,  max(0,     (vib-6) / 31 * 1.5))
+    sf    = 0.5 if status=='new' else (0.8 if status=='worn' else 1.2)
+    return {
+        'cutting_force_n':      round(force, 1),
+        'acoustic_emission_db': round(ae, 1),
+        'surface_finish_ra_um': sf,
+        'wear_progression':     round(wear, 3),
+        'spindle_speed_mmin':   round(15 + (curr-38)*0.5, 1),
+        'feed_rate_mmtooth':    round(0.065 + (temp-77)*0.001, 3),
+        'coolant_flow_lmin':    round(18 + (temp-77)*0.2, 1),
+    }
+
+
+async def ws_handler(websocket):
+    global latest_reading
+    connected.add(websocket)
+    log.info(f'Browser connected — {len(connected)} client(s)')
+    if latest_reading:
+        try:
+            await websocket.send(json.dumps(latest_reading))
+        except Exception:
+            pass
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                if data.get('type') == 'ping':
+                    await websocket.send(json.dumps({'type': 'pong'}))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        connected.discard(websocket)
+        log.info(f'Browser disconnected — {len(connected)} client(s)')
+
+
 async def broadcast(data):
     if not connected: return
     msg  = json.dumps(data)
     dead = set()
     for c in list(connected):
-        try:    await c.send(msg)
-        except: dead.add(c)
+        try:
+            await c.send(msg)
+        except Exception:
+            dead.add(c)
     connected.difference_update(dead)
 
-# ---------- WebSocket handler ---------------------------------------------
-async def ws_handler(ws):
-    global latest_data
-    connected.add(ws)
-    log.info(f'Browser connected ({len(connected)} clients)')
-    await ws.send(json.dumps({'type': 'status', 'status': 'connected'}))
-    try:
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-                if msg.get('type') == 'chat':
-                    messages = msg.get('messages', [])
-                    ctx = ''
-                    if latest_data:
-                        ctx = (f"Temperature: {latest_data.get('temperature_c')}C, "
-                               f"Vibration: {latest_data.get('vibration_rms_mm_s2')} m/s2, "
-                               f"Current: {latest_data.get('spindle_current_a')}A, "
-                               f"Tool Status: {latest_data.get('tool_status')}, "
-                               f"Wear: {latest_data.get('wear_progression')}")
-                    reply = await asyncio.get_event_loop().run_in_executor(None, ai_chat, messages, ctx)
-                    await ws.send(json.dumps({'type': 'chat_reply', 'reply': reply}))
-            except json.JSONDecodeError:
-                pass
-    finally:
-        connected.discard(ws)
-        log.info(f'Browser disconnected ({len(connected)} clients)')
 
-async def ws_handler_legacy(ws, path=None):
-    await ws_handler(ws)
-
-# ---------- Serial loop ---------------------------------------------------
 async def serial_loop(port):
-    global latest_data
-    ser   = None
-    cycle = 0
+    global latest_reading
+    ser = None
     while True:
         if ser is None or not ser.is_open:
             try:
                 ser = serial.Serial(port, BAUD, timeout=1)
-                log.info(f'Opened {port} at {BAUD} baud - waiting for data...')
-                await broadcast({'type': 'status', 'status': 'connected'})
+                log.info(f'Opened {port} at {BAUD} baud — waiting for data...')
             except Exception as e:
-                log.warning(f'Cannot open {port}: {e} - retrying in 3s')
-                await broadcast({'type': 'status', 'status': 'disconnected'})
+                log.warning(f'Cannot open {port}: {e} — retrying in 3s')
                 await asyncio.sleep(3)
                 continue
         try:
             raw = ser.readline().decode('utf-8', errors='ignore')
         except Exception as e:
             log.warning(f'Read error: {e}')
+            try: ser.close()
+            except: pass
             ser = None
             await asyncio.sleep(1)
             continue
@@ -237,64 +298,85 @@ async def serial_loop(port):
             await asyncio.sleep(0.05)
             continue
 
-        temp_raw, vib_raw, curr_raw = result
+        raw_temp, raw_vib, raw_curr = result
 
-        # Clamp to valid ranges
-        temp_raw = max(0,  min(150, temp_raw))
-        vib_raw  = max(0,  min(50,  vib_raw))
-        curr_raw = max(0,  min(60,  curr_raw))
+        # ── Kalman filter ──────────────────────────────────────
+        temp = kalman_temp.update(raw_temp)
+        vib  = kalman_vib.update(raw_vib)
+        curr = kalman_curr.update(raw_curr)
 
-        # Smooth with rolling average
-        temp = smooth(temp_buf, temp_raw)
-        vib  = smooth(vib_buf,  vib_raw)
-        curr = smooth(curr_buf, curr_raw)
+        # ── FFT ───────────────────────────────────────────────
+        fft_analyzer.add(vib)
+        dom_freq = fft_analyzer.dominant_frequency()
 
-        cycle += 1
-        derived = await asyncio.get_event_loop().run_in_executor(None, ai_derive, temp, vib, curr)
+        # ── Multi-sensor status (no false alarms) ─────────────
+        status  = multi_sensor_status(temp, vib, curr)
+        derived = derive(temp, vib, curr, status)
+
+        # ── Remaining life estimate ───────────────────────────
+        life = life_estimator.update(derived['wear_progression'], status)
 
         reading = {
-            'type': 'reading',
-            'data': {
-                'timestamp':           datetime.now().isoformat(),
-                'cycle':               cycle,
-                'temperature_c':       round(temp, 2),
-                'vibration_rms_mm_s2': round(vib,  3),
-                'spindle_current_a':   round(curr, 3),
-                'tool_id':             'TB001',
-                'tool_material':       'Carbide',
-                'coating':             'TiN',
-                **derived,
-            }
+            'timestamp':              datetime.now().isoformat(),
+            'cycle':                  life['cycle_count'],
+            # Raw (unfiltered) for reference
+            'raw_temp':               round(raw_temp, 2),
+            'raw_vib':                round(raw_vib, 2),
+            'raw_curr':               round(raw_curr, 2),
+            # Kalman-filtered (what UI shows)
+            'temperature_c':          round(temp, 2),
+            'vibration_rms_mm_s2':    round(vib, 2),
+            'spindle_current_a':      round(curr, 2),
+            # FFT
+            'dominant_freq_hz':       dom_freq,
+            # Derived
+            'tool_status':            status,
+            'tool_id':                'TB001',
+            'tool_material':          'Carbide',
+            'coating':                'TiN',
+            # Life estimate
+            'remaining_life_pct':     life['remaining_life_pct'],
+            'cycles_remaining':       life['cycles_remaining'],
+            'estimated_time_left':    life['estimated_time_left'],
+            'cumulative_damage_pct':  life['cumulative_damage_pct'],
+            **derived,
         }
-        latest_data = reading['data']
-        reading_history.append(reading['data'])
-        if len(reading_history) > 86400:
-            reading_history.pop(0)
-
+        latest_reading = reading
         await broadcast(reading)
-        log.info(f'#{cycle} T={temp:.1f}C V={vib:.3f} I={curr:.3f}A -> {derived["tool_status"]} [{derived["prediction_source"]}]')
+
+        log.info(
+            f'#{life["cycle_count"]} '
+            f'T={temp:.1f}°C V={vib:.2f} C={curr:.2f}A '
+            f'→ {status} | life={life["remaining_life_pct"]}% '
+            f'({life["estimated_time_left"]} left)'
+            + (f' | FFT={dom_freq:.3f}Hz' if dom_freq else '')
+        )
+
+        # ── MQTT publish ──────────────────────────────────────
+        if mqtt_client:
+            try:
+                mqtt_client.publish(MQTT_TOPIC, json.dumps(reading))
+            except Exception as e:
+                log.warning(f'MQTT publish failed: {e}')
+
         await asyncio.sleep(0.05)
 
-# ---------- Main ----------------------------------------------------------
+
 async def main():
-    print('=' * 52)
-    print('  BROACHING SENSOR BRIDGE v5.2')
-    print(f'  Arduino  : {ARDUINO_PORT}')
-    print(f'  WebSocket: ws://{HOST}:{WS_PORT}')
-    print(f'  AI       : {"ENABLED" if AI_AVAILABLE else "install openai"}')
-    print(f'  Stability: {STATUS_CONFIRM} readings to confirm status')
-    print('=' * 52)
-
-    try:
-        from websockets.asyncio.server import serve as ws_serve_new
-        server = ws_serve_new(ws_handler, HOST, WS_PORT)
-    except ImportError:
-        import websockets as _ws
-        server = _ws.serve(ws_handler_legacy, HOST, WS_PORT)
-
-    async with server:
-        log.info(f'WebSocket server running on ws://{HOST}:{WS_PORT}')
+    print('=' * 55)
+    print('  BROACHING SENSOR BRIDGE v5.0')
+    print(f'  Arduino   : {ARDUINO_PORT}')
+    print(f'  WebSocket : ws://localhost:{WS_PORT}/ws')
+    print(f'  MQTT      : {"enabled → " + MQTT_BROKER if MQTT_ENABLED else "disabled"}')
+    print('  Features  : Kalman filter | FFT | Multi-param alerts')
+    print('             Remaining life estimate | MQTT export')
+    print('=' * 55)
+    async with ws_serve(
+        ws_handler, HOST, WS_PORT,
+        ping_interval=10, ping_timeout=30, close_timeout=10,
+    ):
         await serial_loop(ARDUINO_PORT)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
