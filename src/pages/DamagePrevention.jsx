@@ -137,9 +137,11 @@ export default function DamagePrevention() {
   useEffect(() => {
     if (relayTripped) return;
     const id = setInterval(() => {
-      setCurrent(v  => parseFloat((Math.max(0, v + (Math.random() - 0.47) * 0.8)).toFixed(2)));
-      setPressure(v => parseFloat((Math.max(0, v + (Math.random() - 0.47) * 1.5)).toFixed(2)));
-      setTorque(v   => parseFloat((Math.max(0, v + (Math.random() - 0.47) * 1.0)).toFixed(2)));
+      // Mean-reverting simulation: always pulled back toward baseline + small noise
+      const revert = 0.15; // pull strength toward baseline
+      setCurrent(v  => parseFloat((Math.max(0, v + revert*(12.0 - v) + (Math.random()-0.5)*0.6)).toFixed(2)));
+      setPressure(v => parseFloat((Math.max(0, v + revert*(80.0 - v) + (Math.random()-0.5)*1.2)).toFixed(2)));
+      setTorque(v   => parseFloat((Math.max(0, v + revert*(44.0 - v) + (Math.random()-0.5)*0.8)).toFixed(2)));
     }, 800);
     return () => clearInterval(id);
   }, [relayTripped, resetKey]);
