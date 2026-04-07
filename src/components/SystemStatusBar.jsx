@@ -1,15 +1,17 @@
-import { useMachine } from '../context/MachineContext';
-import { ShieldCheck, AlertTriangle, Zap, RotateCcw, Settings } from 'lucide-react';
+import { useMachine, useSimulation } from '../context/MachineContext';
+import { ShieldCheck, AlertTriangle, Zap, RotateCcw } from 'lucide-react';
 
-export default function SystemStatusBar({ onOpenSettings }) {
-  const { systemStatus, machineProfile, failureThreshold, resetStatus, sensorBaseline } = useMachine();
+export default function SystemStatusBar() {
+  const { systemStatus, machineProfile, failureThreshold, resetStatus } = useMachine();
+  const { isCalibrated } = useSimulation();
 
   const cfg = {
-    ARMED:   { color: '#00e5ff', bg: 'bg-[#00e5ff]/5  border-[#00e5ff]/15',  icon: ShieldCheck, label: 'ARMED — All Systems Normal',         pulse: false },
-    WARNING: { color: '#ffba38', bg: 'bg-[#ffba38]/10 border-[#ffba38]/30',  icon: AlertTriangle, label: 'WARNING — Threshold Approaching',   pulse: true  },
-    ESTOP:   { color: '#ffb4ab', bg: 'bg-[#93000a]/20 border-[#ffb4ab]/40',  icon: Zap,           label: 'E-STOP TRIGGERED — Power Cut',       pulse: true  },
+    ARMED:   { color: '#00e5ff', bg: 'bg-[#00e5ff]/5  border-[#00e5ff]/15',  icon: ShieldCheck,   label: 'SYSTEM ARMED — All Systems Normal',    pulse: false },
+    WARNING: { color: '#ffba38', bg: 'bg-[#ffba38]/10 border-[#ffba38]/30',  icon: AlertTriangle, label: 'WARNING — Threshold Approaching',        pulse: true  },
+    ESTOP:   { color: '#ffb4ab', bg: 'bg-[#93000a]/20 border-[#ffb4ab]/40',  icon: Zap,           label: 'E-STOP TRIGGERED — Power Cut',           pulse: true  },
   };
-  const c    = cfg[systemStatus];
+
+  const c    = cfg[systemStatus] || cfg.ARMED;
   const Icon = c.icon;
 
   return (
@@ -24,8 +26,8 @@ export default function SystemStatusBar({ onOpenSettings }) {
         <span className="text-[9px] uppercase tracking-wider">
           Threshold: <b style={{ color: c.color }}>{(failureThreshold * 100).toFixed(0)}%</b>
         </span>
-        {sensorBaseline.temperature && (
-          <span className="text-[9px] uppercase tracking-wider text-[#00e5ff]">● CALIBRATED</span>
+        {isCalibrated && (
+          <span className="text-[9px] uppercase tracking-wider text-[#00e5ff] font-bold">● CALIBRATED</span>
         )}
       </div>
 
