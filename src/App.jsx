@@ -11,6 +11,7 @@ import SettingsPage from './pages/Settings';
 import AiPredictor from './pages/AiPredictor';
 import Chatbot from './pages/Chatbot';
 import SensorReadings from './pages/SensorReadings';
+import DamagePrevention from './pages/DamagePrevention';
 
 function AppShell() {
   const { initialized } = useMachine();
@@ -21,6 +22,7 @@ function AppShell() {
       case 'dashboard':   return <Dashboard />;
       case 'performance': return <Performance />;
       case 'inventory':   return <Inventory />;
+      case 'damage':      return <DamagePrevention />;
       case 'alerts':      return <AlertsPage />;
       case 'records':     return <Records />;
       case 'settings':    return <SettingsPage />;
