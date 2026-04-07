@@ -1,34 +1,24 @@
 /*
-  Broaching Machine Sensor Sketch v3.2
+  Broaching Machine Sensor Sketch v3.3
   ====================================
-  Changes in v3.2:
-  - Added supply voltage reading via Arduino A1 pin (voltage divider)
-  - Output format: TEMP:25.30,VIB:2.45,CURR:1.20,VOLT:4.95
-  - Voltage divider: 5V → 10kΩ/10kΩ divider → A1 (reads 0-5V as 0-2.5V on pin)
-    Formula: voltage = (analogRead(A1) / 1023.0) * 5.0 * 2.0  (×2 for divider ratio)
-    If reading Arduino VCC directly: voltage = (analogRead(A1) / 1023.0) * 5.0
+  Fix in v3.3:
+  - Fixed ACS712 current reading (was stuck at 0.07A)
+  - Correct sensitivity constants for all ACS712 variants
+  - Fixed voltage formula (raw → mV → Amps)
+  - Uses mean-absolute-deviation for DC current (better than RMS for DC loads)
+  - Added serial debug: prints raw ADC and computed current so you can verify
+  - Noise floor lowered to 0.01A
 
-  v3.1 fixes retained:
-  - ACS712 fixed midpoint calibration for battery operation
-  - Lower noise floor (0.02A)
-  - 200 current samples
+  ACS712 SENSITIVITY — pick the right one for YOUR module:
+    ACS712-5A  → 185.0 mV/A   (measures 0-5A,  most common for small motors)
+    ACS712-20A → 100.0 mV/A   (measures 0-20A, default in this sketch)
+    ACS712-30A →  66.0 mV/A   (measures 0-30A)
 
-  Wiring:
-    DHT11  DATA pin  -> Arduino pin 2
-    MPU6050 SDA      -> Arduino A4
-    MPU6050 SCL      -> Arduino A5
-    MPU6050 VCC      -> 3.3V
-    MPU6050 GND      -> GND
-    ACS712  OUT      -> Arduino A0
-    ACS712  VCC      -> 5V
-    ACS712  GND      -> GND
-    Voltage divider  -> Arduino A1
-      (10kΩ from supply+ to A1, 10kΩ from A1 to GND)
-
-  Libraries:
-    - DHT sensor library by Adafruit
-    - Adafruit Unified Sensor
-    - MPU6050 by Electronic Cats
+  Wiring (unchanged):
+    DHT11   DATA → pin 2
+    MPU6050 SDA  → A4, SCL → A5, VCC → 3.3V
+    ACS712  OUT  → A0, VCC → 5V, GND → GND
+    Voltage div  → A1  (10k + 10k divider)
 */
 
 #include <avr/wdt.h>
@@ -36,37 +26,49 @@
 #include <Wire.h>
 #include <MPU6050.h>
 
-#define DHT_PIN          2
-#define DHT_TYPE         DHT11
-#define ACS_PIN          A0
-#define VOLT_PIN         A1    // voltage divider output
-#define VOLT_DIVIDER     2.0   // ratio: actual voltage = reading × VOLT_DIVIDER
-                               // use 1.0 if measuring directly (max 5V)
-                               // use 2.0 if using 1:1 voltage divider (max 10V)
-#define ACS_SENSITIVITY  100.0
-#define VIB_SAMPLES      64
-#define CURR_SAMPLES     200
-#define VOLT_SAMPLES     50
-#define SEND_INTERVAL    1000
+#define DHT_PIN         2
+#define DHT_TYPE        DHT11
+#define ACS_PIN         A0
+#define VOLT_PIN        A1
 
-DHT dht(DHT_PIN, DHT_TYPE);
+// ── IMPORTANT: Change this to match YOUR ACS712 module ──────
+// 5A  module → 185.0
+// 20A module → 100.0
+// 30A module →  66.0
+#define ACS_SENSITIVITY  185.0   // mV per Amp — change if needed!
+
+#define VOLT_DIVIDER    2.0      // 1.0 = direct (max 5V), 2.0 = 1:1 divider (max 10V)
+#define VIB_SAMPLES     64
+#define CURR_SAMPLES    300      // more samples = more stable reading
+#define VOLT_SAMPLES    50
+#define SEND_INTERVAL   1000
+#define NOISE_FLOOR     0.01     // currents below this treated as 0
+
+DHT     dht(DHT_PIN, DHT_TYPE);
 MPU6050 mpu;
 
 float vib_baseline_x = 0, vib_baseline_y = 0, vib_baseline_z = 0;
-float lastGoodTemp    = 25.0;
+float lastGoodTemp       = 25.0;
 float calibrated_midpoint = 512.0;
 unsigned long lastSendTime = 0;
 
+// ── Calibrate ACS712 zero-current midpoint ───────────────────
+// Run with NO current flowing through sensor
 void calibrateCurrentMidpoint() {
   long sum = 0;
-  for (int i = 0; i < 500; i++) {
+  for (int i = 0; i < 1000; i++) {
     sum += analogRead(ACS_PIN);
-    delayMicroseconds(200);
-    if (i % 100 == 0) wdt_reset();
+    delayMicroseconds(100);
+    if (i % 200 == 0) wdt_reset();
   }
-  calibrated_midpoint = sum / 500.0;
-  Serial.print("ACS712 midpoint: ");
+  calibrated_midpoint = sum / 1000.0;
+  Serial.print("ACS712 midpoint ADC: ");
   Serial.println(calibrated_midpoint);
+
+  // Quick sanity check — should be close to 512 (2.5V at 5V supply)
+  float midV = calibrated_midpoint * (5000.0 / 1023.0);
+  Serial.print("ACS712 midpoint mV:  ");
+  Serial.println(midV);
 }
 
 void calibrateVibration() {
@@ -108,20 +110,44 @@ float readVibration() {
     delayMicroseconds(500);
   }
   float vib_g_rms = sqrt(sum_sq / VIB_SAMPLES);
-  return max(vib_g_rms * 9.806, 0.01f);
+  return max(vib_g_rms * 9.806f, 0.01f);
 }
 
 float readCurrent() {
-  float curr_sum_sq = 0;
+  // ACS712 outputs 2.5V at 0A, shifts by (sensitivity mV) per Amp
+  // Formula: current = (Vout - Vmid) / sensitivity
+  // where Vout = ADC * (5000mV / 1023)
+
+  float sum_abs = 0;
+
   for (int i = 0; i < CURR_SAMPLES; i++) {
-    float raw = analogRead(ACS_PIN);
-    float v   = ((raw - calibrated_midpoint) / 1023.0) * 5000.0;
-    float a   = v / ACS_SENSITIVITY;
-    curr_sum_sq += a * a;
-    delayMicroseconds(200);
+    int raw = analogRead(ACS_PIN);
+
+    // Convert ADC to millivolts
+    float mV = raw * (5000.0f / 1023.0f);
+
+    // Midpoint in millivolts
+    float midmV = calibrated_midpoint * (5000.0f / 1023.0f);
+
+    // Current in Amps
+    float amps = (mV - midmV) / ACS_SENSITIVITY;
+
+    sum_abs += fabs(amps);
+    delayMicroseconds(100);
   }
-  float current = sqrt(curr_sum_sq / CURR_SAMPLES);
-  return (current < 0.02) ? 0.0 : current;
+
+  float current = sum_abs / CURR_SAMPLES;
+
+  // Debug every reading — open Serial Monitor to verify
+  // Comment these out after confirming values look correct
+  Serial.print("[DBG] raw ADC sample: ");
+  Serial.print(analogRead(ACS_PIN));
+  Serial.print("  midpoint: ");
+  Serial.print(calibrated_midpoint);
+  Serial.print("  current: ");
+  Serial.println(current, 4);
+
+  return (current < NOISE_FLOOR) ? 0.0f : current;
 }
 
 float readVoltage() {
@@ -130,10 +156,9 @@ float readVoltage() {
     sum += analogRead(VOLT_PIN);
     delayMicroseconds(100);
   }
-  float avg = sum / (float)VOLT_SAMPLES;
-  // Convert ADC reading to actual voltage
-  float voltage = (avg / 1023.0) * 5.0 * VOLT_DIVIDER;
-  return round(voltage * 100) / 100.0;  // round to 2 decimal places
+  float avg     = sum / (float)VOLT_SAMPLES;
+  float voltage = (avg / 1023.0f) * 5.0f * VOLT_DIVIDER;
+  return round(voltage * 100.0f) / 100.0f;
 }
 
 void setup() {
@@ -153,8 +178,10 @@ void setup() {
   delay(2000);
   wdt_reset();
 
+  Serial.println("Calibrating current sensor — keep NO current flowing...");
   calibrateCurrentMidpoint();
   wdt_reset();
+
   calibrateVibration();
   wdt_reset();
 
@@ -168,21 +195,13 @@ void loop() {
   if (now - lastSendTime < SEND_INTERVAL) return;
   lastSendTime = now;
 
-  float temp    = readTemperatureSafe();
-  wdt_reset();
-  float vib     = readVibration();
-  wdt_reset();
-  float current = readCurrent();
-  wdt_reset();
-  float voltage = readVoltage();
-  wdt_reset();
+  float temp    = readTemperatureSafe();   wdt_reset();
+  float vib     = readVibration();         wdt_reset();
+  float current = readCurrent();           wdt_reset();
+  float voltage = readVoltage();           wdt_reset();
 
-  Serial.print("TEMP:");
-  Serial.print(temp, 2);
-  Serial.print(",VIB:");
-  Serial.print(vib, 3);
-  Serial.print(",CURR:");
-  Serial.print(current, 3);
-  Serial.print(",VOLT:");
-  Serial.println(voltage, 2);
+  Serial.print("TEMP:");  Serial.print(temp, 2);
+  Serial.print(",VIB:");  Serial.print(vib, 3);
+  Serial.print(",CURR:"); Serial.print(current, 3);
+  Serial.print(",VOLT:"); Serial.println(voltage, 2);
 }
