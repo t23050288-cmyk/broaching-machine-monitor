@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { getReadings } from '../utils/storage';
-import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend, LineChart, Line } from 'recharts';
-import { Activity, TrendingUp, Clock, Zap, CheckCircle } from 'lucide-react';
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
+import { Activity, TrendingUp, CheckCircle, Zap, Clock } from 'lucide-react';
 
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
@@ -15,9 +15,46 @@ const CustomTooltip = ({ active, payload, label }) => {
   );
 };
 
-function OEECard({ label, value, color, icon: Icon, unit = '%' }) {
+// Realistic dummy OEE data when no sensor readings exist
+function useDummyOEE() {
+  const [data, setData] = useState([]);
+  useEffect(() => {
+    const now = Date.now();
+    const pts = Array.from({ length: 20 }, (_, i) => {
+      const t = new Date(now - (19 - i) * 60000);
+      return {
+        time: t.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }),
+        oee:  88 + (Math.random() - 0.5) * 4,
+        avail: 91 + (Math.random() - 0.5) * 3,
+        perf:  93 + (Math.random() - 0.5) * 3,
+        qual:  96 + (Math.random() - 0.5) * 2,
+        temp:  29.8 + (Math.random() - 0.5) * 4,
+        volt:  4.93 + (Math.random() - 0.5) * 0.06,
+      };
+    });
+    setData(pts);
+    const id = setInterval(() => {
+      setData(prev => {
+        const t = new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' });
+        return [...prev.slice(-29), {
+          time: t,
+          oee:  88 + (Math.random() - 0.5) * 4,
+          avail: 91 + (Math.random() - 0.5) * 3,
+          perf:  93 + (Math.random() - 0.5) * 3,
+          qual:  96 + (Math.random() - 0.5) * 2,
+          temp:  29.8 + (Math.random() - 0.5) * 4,
+          volt:  4.93 + (Math.random() - 0.5) * 0.06,
+        }];
+      });
+    }, 5000);
+    return () => clearInterval(id);
+  }, []);
+  return data;
+}
+
+function StatCard({ label, value, unit, color, icon: Icon, sub }) {
   return (
-    <div className="bg-[#1c2026] rounded-xl p-5">
+    <div className="bg-[#1c2026] rounded-xl p-4">
       <div className="flex items-center gap-2 mb-2">
         <Icon size={13} style={{ color }}/>
         <span className="text-[9px] uppercase tracking-[0.15em] text-[#849396]">{label}</span>
@@ -26,12 +63,14 @@ function OEECard({ label, value, color, icon: Icon, unit = '%' }) {
         <span className="text-3xl font-black font-headline" style={{ color }}>{value}</span>
         <span className="text-[#849396] text-sm mb-1">{unit}</span>
       </div>
+      {sub && <div className="text-[9px] text-[#849396] mt-1">{sub}</div>}
     </div>
   );
 }
 
 export default function Performance() {
   const [readings, setReadings] = useState([]);
+  const dummyData = useDummyOEE();
 
   useEffect(() => {
     const load = () => setReadings(getReadings().slice(-300));
@@ -40,49 +79,62 @@ export default function Performance() {
     return () => clearInterval(t);
   }, []);
 
-  const chartData = readings.map(r => ({
-    time:    new Date(r.timestamp).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }),
-    temp:    r.temperature_c,
-    vib:     r.vibration_rms_mm_s2,
-    current: r.spindle_current_a,
-    force:   r.cutting_force_n,
-    life:    r.remaining_life_pct,
-    wear:    r.wear_progression,
-  }));
+  const hasRealData = readings.length > 5;
 
-  const toolGroups = {};
-  readings.forEach(r => {
-    if (!toolGroups[r.tool_id]) toolGroups[r.tool_id] = { new: 0, worn: 0, failed: 0 };
-    if (r.tool_status) toolGroups[r.tool_id][r.tool_status] = (toolGroups[r.tool_id][r.tool_status] || 0) + 1;
-  });
-  const barData = Object.entries(toolGroups).map(([id, s]) => ({ id, ...s }));
+  // Build chart data from real readings or dummy
+  const chartData = hasRealData
+    ? readings.map(r => ({
+        time: new Date(r.timestamp).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }),
+        temp: r.temperature_c,
+        volt: r.supply_voltage_v,
+        life: r.remaining_life_pct,
+      }))
+    : dummyData;
 
-  const total   = readings.length;
-  const newCount    = readings.filter(r => r.tool_status === 'new').length;
-  const wornCount   = readings.filter(r => r.tool_status === 'worn').length;
-  const failedCount = readings.filter(r => r.tool_status === 'failed').length;
-
-  // OEE calculation
-  // Availability = non-failed readings / total
-  // Performance  = (new + worn) / total
-  // Quality      = new readings / total
-  const availability = total ? ((total - failedCount) / total * 100) : 0;
-  const performance  = total ? ((newCount + wornCount) / total * 100) : 0;
-  const quality      = total ? (newCount / total * 100) : 0;
-  const oee          = (availability / 100) * (performance / 100) * (quality / 100) * 100;
-
-  const avgTemp  = total ? (readings.reduce((a, r) => a + (r.temperature_c || 0), 0) / total).toFixed(1) : '--';
-  const avgVib   = total ? (readings.reduce((a, r) => a + (r.vibration_rms_mm_s2 || 0), 0) / total).toFixed(2) : '--';
-  const failRate = total ? ((failedCount / total) * 100).toFixed(1) : '0';
-  const latestLife = readings.length ? readings[readings.length - 1]?.remaining_life_pct : null;
+  // OEE — realistic if real data, dummy if not
+  let oee, availability, performance, quality;
+  if (hasRealData) {
+    const total      = readings.length;
+    const failed     = readings.filter(r => r.tool_status === 'failed').length;
+    const newCount   = readings.filter(r => r.tool_status === 'new').length;
+    const wornCount  = readings.filter(r => r.tool_status === 'worn').length;
+    availability = total ? ((total - failed) / total * 100) : 0;
+    performance  = total ? ((newCount + wornCount) / total * 100) : 0;
+    quality      = total ? (newCount / total * 100) : 0;
+    oee          = (availability / 100) * (performance / 100) * (quality / 100) * 100;
+  } else {
+    const latest = dummyData[dummyData.length - 1] ?? {};
+    oee          = latest.oee   ?? 88.5;
+    availability = latest.avail ?? 91.2;
+    performance  = latest.perf  ?? 93.4;
+    quality      = latest.qual  ?? 96.1;
+  }
 
   const oeeColor = oee >= 85 ? '#00e5ff' : oee >= 65 ? '#ffba38' : '#ffb4ab';
 
+  // Avg temp from real or last dummy point
+  const avgTemp = hasRealData
+    ? (readings.reduce((a, r) => a + (r.temperature_c || 0), 0) / readings.length).toFixed(1)
+    : (dummyData.reduce((a, d) => a + (d.temp || 0), 0) / (dummyData.length || 1)).toFixed(1);
+
+  const latestVolt = hasRealData
+    ? (readings[readings.length - 1]?.supply_voltage_v ?? 4.93).toFixed(2)
+    : (dummyData[dummyData.length - 1]?.volt ?? 4.93).toFixed(2);
+
   return (
     <div className="p-6 space-y-6">
-      <div>
-        <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Performance Analysis</h1>
-        <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">Last {total} readings from your device</div>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Performance Analysis</h1>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">
+            {hasRealData ? `${readings.length} live readings` : 'Demo mode — realistic simulated OEE'}
+          </div>
+        </div>
+        {!hasRealData && (
+          <span className="text-[9px] bg-[#ffba38]/10 text-[#ffba38] border border-[#ffba38]/20 px-3 py-1.5 rounded-full uppercase tracking-wider">
+            Demo Data
+          </span>
+        )}
       </div>
 
       {/* OEE Section */}
@@ -93,109 +145,71 @@ export default function Performance() {
           <span className="text-[9px] text-[#849396] ml-auto">Availability × Performance × Quality</span>
         </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-          <OEECard label="OEE Score"     value={oee.toFixed(1)}          color={oeeColor}    icon={TrendingUp}/>
-          <OEECard label="Availability"  value={availability.toFixed(1)} color="#00e5ff"     icon={CheckCircle}/>
-          <OEECard label="Performance"   value={performance.toFixed(1)}  color="#ffba38"     icon={Activity}/>
-          <OEECard label="Quality Rate"  value={quality.toFixed(1)}      color="#818cf8"     icon={Zap}/>
+          <StatCard label="OEE Score"    value={oee.toFixed(1)}          color={oeeColor}   icon={TrendingUp} unit="%"/>
+          <StatCard label="Availability" value={availability.toFixed(1)} color="#00e5ff"    icon={CheckCircle} unit="%"/>
+          <StatCard label="Performance"  value={performance.toFixed(1)}  color="#ffba38"    icon={Activity} unit="%"/>
+          <StatCard label="Quality Rate" value={quality.toFixed(1)}      color="#818cf8"    icon={Zap} unit="%"/>
         </div>
-        {/* OEE bar */}
         <div>
           <div className="flex justify-between text-[9px] text-[#849396] mb-1.5">
-            <span>OEE TARGET: 85%</span>
+            <span>TARGET: 85%</span>
             <span style={{ color: oeeColor }}>{oee.toFixed(1)}% ACTUAL</span>
           </div>
           <div className="h-2.5 bg-[#10141a] rounded-full overflow-hidden">
             <div className="h-full rounded-full transition-all duration-700"
-              style={{ width: `${Math.min(100, oee)}%`, background: `linear-gradient(90deg, ${oeeColor}99, ${oeeColor})` }}/>
+              style={{ width: `${Math.min(100, oee)}%`, background: `linear-gradient(90deg, ${oeeColor}88, ${oeeColor})` }}/>
           </div>
-          <div className="text-[9px] text-[#849396] mt-1">
-            {oee >= 85 ? '✓ World-class OEE achieved' : oee >= 65 ? '⚠ Below target — check worn/failed readings' : '✗ Poor OEE — immediate attention required'}
+          <div className="text-[9px] text-[#849396] mt-1.5">
+            {oee >= 85 ? '✓ World-class OEE' : oee >= 65 ? '⚠ Below target — monitor worn readings' : '✗ Poor OEE — immediate attention'}
           </div>
         </div>
       </div>
 
       {/* Summary stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {[
-          ['Avg Temperature', avgTemp,  '°C',  '#00daf3'],
-          ['Avg Vibration',   avgVib,   'mm/s²','#ffba38'],
-          ['Failure Rate',    failRate, '%',    '#ffb4ab'],
-          ['Tool Life Left',  latestLife != null ? latestLife.toFixed(1) : '--', '%', '#00e5ff'],
-        ].map(([l, v, u, c]) => (
-          <div key={l} className="bg-[#1c2026] rounded-xl p-4">
-            <div className="text-[9px] uppercase tracking-[0.15em] text-[#849396] mb-2">{l}</div>
-            <div className="flex items-end gap-1">
-              <span className="text-3xl font-black font-headline" style={{ color: c }}>{v}</span>
-              <span className="text-[#849396] text-sm mb-1">{u}</span>
-            </div>
-          </div>
-        ))}
+        <StatCard label="Avg Temperature"  value={avgTemp}     unit="°C" color="#ff9259" icon={Activity}/>
+        <StatCard label="Supply Voltage"   value={latestVolt}  unit="V"  color="#4ade80" icon={Zap}/>
+        <StatCard label="OEE Score"        value={oee.toFixed(1)} unit="%" color={oeeColor} icon={TrendingUp}/>
+        <StatCard label="Data Points"      value={hasRealData ? readings.length : dummyData.length} unit="" color="#818cf8" icon={Clock} sub={hasRealData ? 'Live readings' : 'Demo points'}/>
       </div>
 
-      {/* Tool Life trend chart */}
-      {chartData.some(d => d.life != null) && (
-        <div className="bg-[#1c2026] rounded-xl p-5">
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4 flex items-center gap-2">
-            <Clock size={12} className="text-[#00e5ff]"/> Tool Life % Over Time
-          </div>
-          <ResponsiveContainer width="100%" height={160}>
-            <AreaChart data={chartData}>
-              <defs>
-                <linearGradient id="lifeGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor="#00e5ff" stopOpacity={0.3}/>
-                  <stop offset="95%" stopColor="#00e5ff" stopOpacity={0}/>
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#3b494c22"/>
-              <XAxis dataKey="time" tick={{ fill: '#849396', fontSize: 9 }} interval="preserveStartEnd"/>
-              <YAxis domain={[0, 100]} tick={{ fill: '#849396', fontSize: 9 }}/>
-              <Tooltip content={<CustomTooltip/>}/>
-              <Area type="monotone" dataKey="life" stroke="#00e5ff" fill="url(#lifeGrad)" strokeWidth={2} name="Life %"/>
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-
-      {/* Sensor trends */}
+      {/* Trend Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-[#1c2026] rounded-xl p-5">
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4">Temperature & Vibration</div>
-          <ResponsiveContainer width="100%" height={200}>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4">OEE Trend</div>
+          <ResponsiveContainer width="100%" height={180}>
             <AreaChart data={chartData}>
               <defs>
-                <linearGradient id="tempG" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor="#00daf3" stopOpacity={0.3}/>
-                  <stop offset="95%" stopColor="#00daf3" stopOpacity={0}/>
+                <linearGradient id="oeeG" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={oeeColor} stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor={oeeColor} stopOpacity={0}/>
                 </linearGradient>
-                <linearGradient id="vibG" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor="#ffba38" stopOpacity={0.3}/>
-                  <stop offset="95%" stopColor="#ffba38" stopOpacity={0}/>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#3b494c22"/>
+              <XAxis dataKey="time" tick={{ fill: '#849396', fontSize: 9 }} interval="preserveStartEnd"/>
+              <YAxis domain={[60, 100]} tick={{ fill: '#849396', fontSize: 9 }}/>
+              <Tooltip content={<CustomTooltip/>}/>
+              <Area type="monotone" dataKey="oee" stroke={oeeColor} fill="url(#oeeG)" strokeWidth={2} name="OEE %"/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-[#1c2026] rounded-xl p-5">
+          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4">Temperature Trend</div>
+          <ResponsiveContainer width="100%" height={180}>
+            <AreaChart data={chartData}>
+              <defs>
+                <linearGradient id="tempG2" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#ff9259" stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor="#ff9259" stopOpacity={0}/>
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#3b494c22"/>
               <XAxis dataKey="time" tick={{ fill: '#849396', fontSize: 9 }} interval="preserveStartEnd"/>
               <YAxis tick={{ fill: '#849396', fontSize: 9 }}/>
               <Tooltip content={<CustomTooltip/>}/>
-              <Legend wrapperStyle={{ fontSize: '10px', color: '#849396' }}/>
-              <Area type="monotone" dataKey="temp"    stroke="#00daf3" fill="url(#tempG)" strokeWidth={2} name="Temp °C"/>
-              <Area type="monotone" dataKey="vib"     stroke="#ffba38" fill="url(#vibG)"  strokeWidth={2} name="Vib mm/s²"/>
+              <Area type="monotone" dataKey="temp" stroke="#ff9259" fill="url(#tempG2)" strokeWidth={2} name="Temp °C"/>
             </AreaChart>
-          </ResponsiveContainer>
-        </div>
-
-        <div className="bg-[#1c2026] rounded-xl p-5">
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4">Tool Status Distribution</div>
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={barData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#3b494c22"/>
-              <XAxis dataKey="id" tick={{ fill: '#849396', fontSize: 9 }}/>
-              <YAxis tick={{ fill: '#849396', fontSize: 9 }}/>
-              <Tooltip content={<CustomTooltip/>}/>
-              <Legend wrapperStyle={{ fontSize: '10px', color: '#849396' }}/>
-              <Bar dataKey="new"    fill="#00e5ff" name="New"    radius={[3,3,0,0]}/>
-              <Bar dataKey="worn"   fill="#ffba38" name="Worn"   radius={[3,3,0,0]}/>
-              <Bar dataKey="failed" fill="#ffb4ab" name="Failed" radius={[3,3,0,0]}/>
-            </BarChart>
           </ResponsiveContainer>
         </div>
       </div>
