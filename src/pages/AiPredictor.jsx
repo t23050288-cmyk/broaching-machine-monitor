@@ -1,109 +1,136 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useMachine } from '../context/MachineContext';
-import { useSensorData } from '../hooks/useSensorData';
-import {
-  Brain, AlertOctagon, AlertTriangle, CheckCircle2,
-  Cpu, RefreshCw, Clock, Activity, Zap, TrendingDown
-} from 'lucide-react';
+import { useSimulation } from '../hooks/useSimulation';
+import { Brain, Activity, Zap, TrendingDown, RefreshCw, Clock, CheckCircle2, AlertOctagon, AlertTriangle } from 'lucide-react';
 
-// ── Dummy fluctuating data for when no sensor connected ───────
-function useDemoSensor() {
-  const [d, setD] = useState({ temperature_c: 29.8, supply_voltage_v: 4.93, remaining_life_pct: 87, cycles_remaining: 3820, wear_progression: 0.11 });
-  useEffect(() => {
-    const id = setInterval(() => setD({
-      temperature_c:     29.8 + (Math.random() - 0.5) * 4,
-      supply_voltage_v:  4.93 + (Math.random() - 0.5) * 0.06,
-      remaining_life_pct: 87 + (Math.random() - 0.5) * 2,
-      cycles_remaining:  3820 + Math.round((Math.random() - 0.5) * 30),
-      wear_progression:  0.11 + Math.random() * 0.02,
-    }), 2000);
-    return () => clearInterval(id);
-  }, []);
-  return d;
+// ── Auto-generate diagnostic lines ───────────────────────────
+function generateDiagnostic(data, prevData, threshold, isCalibrated, getDeviation) {
+  if (!data) return null;
+  const now = new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  if (data.spike_active) {
+    const currDev = isCalibrated ? getDeviation('current', data.spindle_current_a) : 0;
+    const pressDev = isCalibrated ? getDeviation('pressure', data.hydraulic_pressure_bar) : 0;
+    if (currDev > threshold && pressDev > threshold) {
+      return {
+        ts: now, level: 'CRITICAL', color: '#ffb4ab',
+        icon: 'estop',
+        title: 'Critical Combined Load Spike',
+        body: `Current +${(currDev * 100).toFixed(1)}%, Pressure +${(pressDev * 100).toFixed(1)}% — Diagnostic: Tool Dullness/Friction. Chip Packing. Recommended Action: Stop and Regrind.`,
+      };
+    }
+    return {
+      ts: now, level: 'WARNING', color: '#ffba38',
+      icon: 'warn',
+      title: 'Anomaly Detected: Load Spike',
+      body: `Combined load spike ${(Math.max(currDev, pressDev) * 100).toFixed(1)}%. Diagnostic: Elevated friction signature. Monitor closely — regrind if persists.`,
+    };
+  }
+
+  // Routine analysis (every few seconds)
+  const routines = [
+    'Analyzing Force Signature… Stable.',
+    'Vibration Spectrum: Low-frequency dominant. Normal wear signature.',
+    'Thermal Profile: Within operational range.',
+    'Hydraulic Circuit: Pressure nominal.',
+    'Tool Edge Condition: No anomalies detected.',
+    'Current Draw Pattern: Consistent. Tool healthy.',
+    'FFT Analysis: No resonance peaks. Smooth cut.',
+    'Wear Rate Projection: On expected trajectory.',
+  ];
+  const msg = routines[Math.floor(Math.random() * routines.length)];
+  return {
+    ts: now, level: 'INFO', color: '#00e5ff',
+    icon: 'ok',
+    title: 'System Scan',
+    body: msg,
+  };
 }
 
-function DiagnosticCard({ entry }) {
-  const isEStop   = entry.type === 'estop';
-  const isWarning = entry.type === 'warning';
-  const Icon = isEStop ? AlertOctagon : isWarning ? AlertTriangle : CheckCircle2;
-  const color = isEStop ? '#ffb4ab' : isWarning ? '#ffba38' : '#00e5ff';
-  const bg    = isEStop ? 'bg-[#93000a]/15 border-[#ffb4ab]/25' : isWarning ? 'bg-[#ffba38]/8 border-[#ffba38]/25' : 'bg-[#00e5ff]/5 border-[#00e5ff]/20';
+function FeedEntry({ entry }) {
+  const isEStop = entry.icon === 'estop';
+  const isWarn  = entry.icon === 'warn';
+  const Icon = isEStop ? AlertOctagon : isWarn ? AlertTriangle : CheckCircle2;
   return (
-    <div className={`rounded-xl p-4 border ${bg} transition-all`}>
-      <div className="flex items-start gap-3">
-        <Icon size={16} style={{ color }} className={isEStop ? 'animate-pulse mt-0.5' : 'mt-0.5'}/>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color }}>
-              {entry.level}
-            </span>
-            <span className="text-[9px] text-[#849396]">
-              {new Date(entry.ts).toLocaleTimeString()}
-            </span>
-          </div>
-          <div className="text-xs text-[#dfe2eb] mt-1 leading-relaxed">{entry.message}</div>
+    <div className={`rounded-xl px-4 py-3 border flex gap-3 transition-all
+      ${isEStop ? 'bg-[#93000a]/15 border-[#ffb4ab]/25' :
+        isWarn  ? 'bg-[#ffba38]/8  border-[#ffba38]/20' :
+                  'bg-[#00e5ff]/3  border-[#00e5ff]/10'}`}>
+      <Icon size={14} style={{ color: entry.color }} className={isEStop ? 'animate-pulse mt-0.5 flex-shrink-0' : 'mt-0.5 flex-shrink-0'}/>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: entry.color }}>
+            {entry.level} · {entry.title}
+          </span>
+          <span className="text-[9px] text-[#849396]">{entry.ts}</span>
         </div>
+        <div className="text-xs text-[#849396] mt-0.5 leading-relaxed">{entry.body}</div>
       </div>
     </div>
   );
 }
 
-function RULCard({ latest, demo }) {
-  const d      = latest ?? demo;
-  const pct    = d?.remaining_life_pct ?? 87;
-  const cycles = d?.cycles_remaining   ?? 3820;
-  const wear   = d?.wear_progression   ?? 0.11;
-  const color  = pct > 60 ? '#00e5ff' : pct > 30 ? '#ffba38' : '#ffb4ab';
-
-  // Trend: project wear rate → RUL
-  const cyclesDisplay = cycles.toLocaleString();
-
+function RULCard({ rul, cycles }) {
+  const color = rul > 60 ? '#00e5ff' : rul > 30 ? '#ffba38' : '#ffb4ab';
   return (
     <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
       <div className="flex items-center gap-2 mb-4">
         <TrendingDown size={14} className="text-[#c084fc]"/>
         <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">RUL — Remaining Useful Life</span>
-        <span className="ml-auto text-[9px] text-[#849396]">Wear trend projection</span>
-      </div>
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <div className="bg-[#10141a] rounded-xl p-4 text-center">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">Life Remaining</div>
-          <div className="text-2xl font-black font-headline" style={{ color }}>{pct.toFixed(1)}<span className="text-sm">%</span></div>
-          <div className="h-1.5 bg-[#1c2026] rounded-full overflow-hidden mt-2">
-            <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color, transition: 'width 0.7s' }}/>
-          </div>
-        </div>
-        <div className="bg-[#10141a] rounded-xl p-4 text-center">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1 flex items-center justify-center gap-1">
-            <RefreshCw size={8}/> Est. Cycles
-          </div>
-          <div className="text-2xl font-black font-headline" style={{ color }}>{cyclesDisplay}</div>
-          <div className="text-[9px] text-[#849396] mt-1">remaining</div>
-        </div>
-        <div className="bg-[#10141a] rounded-xl p-4 text-center">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">Wear Index</div>
-          <div className="text-2xl font-black font-headline text-[#ffba38]">{wear.toFixed(3)}</div>
-          <div className="text-[9px] text-[#849396] mt-1">of 1.5 max</div>
-        </div>
-      </div>
-      <div className="text-[10px] text-[#849396] bg-[#10141a] rounded-lg px-3 py-2 border border-[#3b494c]/10">
-        💡 At current wear rate:
-        <span className="font-bold ml-1" style={{ color }}>
-          Estimated {cyclesDisplay} cycles remaining
+        <span className="ml-auto text-[9px] text-[#849396] flex items-center gap-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] animate-pulse inline-block"/>
+          Live projection
         </span>
-        {' '}before tool replacement recommended.
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-[#10141a] rounded-xl p-4 text-center col-span-1">
+          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">Life Left</div>
+          <div className="text-3xl font-black font-headline" style={{ color }}>{rul.toFixed(1)}<span className="text-base">%</span></div>
+          <div className="h-1.5 bg-[#1c2026] rounded-full overflow-hidden mt-2">
+            <div className="h-full rounded-full transition-all duration-700" style={{ width: `${rul}%`, background: color }}/>
+          </div>
+        </div>
+        <div className="bg-[#10141a] rounded-xl p-4 text-center">
+          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1 flex items-center justify-center gap-1"><RefreshCw size={8}/>Cycles</div>
+          <div className="text-2xl font-black font-headline" style={{ color }}>{cycles?.toLocaleString()}</div>
+          <div className="text-[9px] text-[#849396] mt-1">est. remaining</div>
+        </div>
+        <div className="bg-[#10141a] rounded-xl p-4 text-center">
+          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1 flex items-center justify-center gap-1"><Clock size={8}/>Replace at</div>
+          <div className="text-2xl font-black font-headline text-[#ffba38]">20%</div>
+          <div className="text-[9px] text-[#849396] mt-1">threshold</div>
+        </div>
+      </div>
+      <div className="mt-3 text-[10px] text-[#849396] bg-[#10141a] rounded-lg px-3 py-2 border border-[#3b494c]/10">
+        💡 At current wear rate: <span className="font-bold" style={{ color }}>Estimated {cycles?.toLocaleString()} cycles</span> before tool replacement recommended.
       </div>
     </div>
   );
 }
 
 export default function AiPredictor() {
-  const { diagnosticsLog, systemStatus, machineProfile, failureThreshold } = useMachine();
-  const { latest } = useSensorData();
-  const demo = useDemoSensor();
-  const d    = latest ?? demo;
+  const { failureThreshold, machineProfile } = useMachine();
+  const { data, stressTest, isCalibrated, getDeviation, rul } = useSimulation();
 
-  const profileLabel = machineProfile === 'precision' ? 'Precision CNC' : 'Legacy Machine';
+  const [feed, setFeed] = useState([]);
+  const prevDataRef = useRef(null);
+  const tickRef = useRef(0);
+
+  // Auto-generate diagnostic entries
+  useEffect(() => {
+    if (!data) return;
+    tickRef.current += 1;
+
+    // Emit on spike or every 8 ticks (~4 seconds)
+    const shouldEmit = data.spike_active || tickRef.current % 8 === 0;
+    if (!shouldEmit) return;
+
+    const entry = generateDiagnostic(data, prevDataRef.current, failureThreshold, isCalibrated, getDeviation);
+    if (entry) {
+      setFeed(prev => [{ ...entry, id: Date.now() }, ...prev].slice(0, 30));
+    }
+    prevDataRef.current = data;
+  }, [data, failureThreshold, isCalibrated]);
 
   return (
     <div className="p-6 space-y-6 max-w-4xl">
@@ -114,33 +141,40 @@ export default function AiPredictor() {
             <Brain size={22} className="text-[#c084fc]"/> AI Diagnostics
           </h1>
           <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">
-            Autonomous diagnostics · {profileLabel} · {(failureThreshold * 100).toFixed(0)}% threshold
+            Autonomous diagnostics · {machineProfile === 'precision' ? 'Precision CNC' : 'Legacy Machine'} · {(failureThreshold * 100).toFixed(0)}% threshold
           </div>
         </div>
-        <div className={`flex items-center gap-1.5 text-[10px] px-3 py-1.5 rounded-full border font-bold
-          ${systemStatus === 'ESTOP' ? 'text-[#ffb4ab] bg-[#ffb4ab]/10 border-[#ffb4ab]/20 animate-pulse' :
-            systemStatus === 'WARNING' ? 'text-[#ffba38] bg-[#ffba38]/10 border-[#ffba38]/20' :
-            'text-[#00e5ff] bg-[#00e5ff]/10 border-[#00e5ff]/20'}`}>
-          <Cpu size={11}/>
-          {systemStatus === 'ESTOP' ? ' E-STOP ACTIVE' : systemStatus === 'WARNING' ? ' WARNING ACTIVE' : ' SYSTEM ARMED'}
+        <div className="flex items-center gap-2">
+          {stressTest && (
+            <span className="text-[9px] bg-[#ffb4ab]/15 text-[#ffb4ab] px-3 py-1.5 rounded-full border border-[#ffb4ab]/20 animate-pulse font-bold uppercase tracking-wider">
+              ⚡ Stress Test Active
+            </span>
+          )}
+          <span className="text-[9px] bg-[#00e5ff]/10 text-[#00e5ff] px-3 py-1.5 rounded-full border border-[#00e5ff]/20 font-bold uppercase tracking-wider flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] animate-pulse inline-block"/>
+            Live Feed
+          </span>
         </div>
       </div>
 
-      {/* RUL Card */}
-      <RULCard latest={latest} demo={demo}/>
+      {/* RUL */}
+      <RULCard rul={rul} cycles={data?.cycles_remaining}/>
 
       {/* Live sensor snapshot */}
       <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
-        <div className="flex items-center gap-2 mb-4">
+        <div className="flex items-center gap-2 mb-3">
           <Activity size={14} className="text-[#00e5ff]"/>
           <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Live Sensor Snapshot</span>
-          {latest && <span className="ml-auto text-[9px] text-[#00e5ff] animate-pulse">● LIVE</span>}
-          {!latest && <span className="ml-auto text-[9px] text-[#849396]">Demo data</span>}
+          <span className="ml-auto text-[9px] text-[#00e5ff] animate-pulse flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] inline-block"/>LIVE
+          </span>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           {[
-            ['Temperature', d?.temperature_c?.toFixed(1) ?? '--', '°C', '#ff9259'],
-            ['Supply Voltage', d?.supply_voltage_v?.toFixed(2) ?? '--', 'V', '#4ade80'],
+            ['Temperature',  data?.temperature_c?.toFixed(1) ?? '--',         '°C',   '#ff9259'],
+            ['Voltage',      data?.supply_voltage_v?.toFixed(3) ?? '--',      'V',    '#4ade80'],
+            ['Current',      data?.spindle_current_a?.toFixed(4) ?? '--',     'A',    '#818cf8'],
+            ['Hyd. Pressure',data?.hydraulic_pressure_bar?.toFixed(2) ?? '--','bar',  '#00daf3'],
           ].map(([lbl, val, unit, col]) => (
             <div key={lbl} className="bg-[#10141a] rounded-lg p-3">
               <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">{lbl}</div>
@@ -152,40 +186,37 @@ export default function AiPredictor() {
         </div>
       </div>
 
-      {/* Autonomous Diagnostics Log */}
+      {/* Live Diagnostic Feed */}
       <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
         <div className="flex items-center gap-2 mb-4">
           <Zap size={14} className="text-[#ffba38]"/>
-          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Autonomous Diagnostics Log</span>
-          {diagnosticsLog.length > 0 && (
-            <span className="ml-auto text-[9px] bg-[#ffb4ab]/15 text-[#ffb4ab] px-2 py-0.5 rounded-full border border-[#ffb4ab]/20">
-              {diagnosticsLog.length} event{diagnosticsLog.length !== 1 ? 's' : ''}
+          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Live Diagnostic Feed</span>
+          {feed.length > 0 && (
+            <span className="ml-auto text-[9px] bg-[#1c2026] text-[#849396] px-2 py-0.5 rounded-full">
+              {feed.length} events
             </span>
           )}
         </div>
 
-        {diagnosticsLog.length === 0 ? (
+        {feed.length === 0 ? (
           <div className="text-center py-8 space-y-2">
-            <CheckCircle2 size={24} className="mx-auto text-[#00e5ff]/40"/>
-            <div className="text-sm text-[#849396]">No diagnostic events yet</div>
-            <div className="text-[10px] text-[#3b494c]">Calibrate the tool baseline and the engine will auto-diagnose any deviations</div>
+            <span className="text-3xl">📡</span>
+            <div className="text-sm text-[#849396]">Initializing diagnostic engine…</div>
           </div>
         ) : (
-          <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
-            {diagnosticsLog.map(entry => <DiagnosticCard key={entry.id} entry={entry}/>)}
+          <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
+            {feed.map(e => <FeedEntry key={e.id} entry={e}/>)}
           </div>
         )}
 
         {/* Logic reference */}
-        <div className="mt-4 border-t border-[#3b494c]/15 pt-4 space-y-1.5">
-          <div className="text-[9px] uppercase tracking-wider text-[#3b494c] mb-2">Diagnostic Logic</div>
+        <div className="mt-4 pt-4 border-t border-[#3b494c]/15 space-y-1.5">
+          <div className="text-[9px] uppercase tracking-wider text-[#3b494c] mb-2">Diagnostic Rules</div>
           <div className="text-[10px] text-[#849396] flex gap-2">
-            <span className="text-[#ffba38]">▸</span>
-            Temperature &gt; threshold only → "Thermal Anomaly. Check coolant / ambient."
+            <span className="text-[#ffba38]">▸</span> Single spike → Warning. Recommended: Monitor &amp; Inspect.
           </div>
           <div className="text-[10px] text-[#849396] flex gap-2">
-            <span className="text-[#ffb4ab]">▸</span>
-            Temperature + Voltage both exceed → "Critical Correlation Spike. E-Stop deployed."
+            <span className="text-[#ffb4ab]">▸</span> Both Current &amp; Pressure → CRITICAL. E-Stop + Chip Packing diagnosis.
           </div>
         </div>
       </div>
