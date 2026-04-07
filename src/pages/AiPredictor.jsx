@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { useMachine } from '../context/MachineContext';
-import { useSimulation } from '../hooks/useSimulation';
+import { useMachine, useSimulation } from '../context/MachineContext';
 import { Brain, Activity, Zap, TrendingDown, RefreshCw, Clock, CheckCircle2, AlertOctagon, AlertTriangle } from 'lucide-react';
 
 // ── Auto-generate diagnostic lines ───────────────────────────
