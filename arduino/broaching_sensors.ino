@@ -1,20 +1,19 @@
 /*
-  Broaching Machine Sensor Sketch v3.3
+  Broaching Machine Sensor Sketch v3.4
   ====================================
-  Fix in v3.3:
-  - Fixed ACS712 current reading (was stuck at 0.07A)
-  - Correct sensitivity constants for all ACS712 variants
-  - Fixed voltage formula (raw → mV → Amps)
-  - Uses mean-absolute-deviation for DC current (better than RMS for DC loads)
-  - Added serial debug: prints raw ADC and computed current so you can verify
-  - Noise floor lowered to 0.01A
+  Fixes in v3.4:
+  - ACS712 current no longer freezes or repeats same value
+  - Midpoint is recalibrated every 30 readings (handles ADC drift)
+  - Removed debug Serial.print from inside read loop (was slowing ADC)
+  - Reduced sample count but added quality check to detect stuck values
+  - Watchdog timer still active as safety net
 
-  ACS712 SENSITIVITY — pick the right one for YOUR module:
-    ACS712-5A  → 185.0 mV/A   (measures 0-5A,  most common for small motors)
-    ACS712-20A → 100.0 mV/A   (measures 0-20A, default in this sketch)
-    ACS712-30A →  66.0 mV/A   (measures 0-30A)
+  ACS712 SENSITIVITY:
+    5A  module → 185.0 mV/A
+    20A module → 100.0 mV/A
+    30A module →  66.0 mV/A
 
-  Wiring (unchanged):
+  Wiring:
     DHT11   DATA → pin 2
     MPU6050 SDA  → A4, SCL → A5, VCC → 3.3V
     ACS712  OUT  → A0, VCC → 5V, GND → GND
@@ -26,49 +25,46 @@
 #include <Wire.h>
 #include <MPU6050.h>
 
-#define DHT_PIN         2
-#define DHT_TYPE        DHT11
-#define ACS_PIN         A0
-#define VOLT_PIN        A1
+#define DHT_PIN          2
+#define DHT_TYPE         DHT11
+#define ACS_PIN          A0
+#define VOLT_PIN         A1
 
-// ── IMPORTANT: Change this to match YOUR ACS712 module ──────
-// 5A  module → 185.0
-// 20A module → 100.0
-// 30A module →  66.0
-#define ACS_SENSITIVITY  185.0   // mV per Amp — change if needed!
-
-#define VOLT_DIVIDER    2.0      // 1.0 = direct (max 5V), 2.0 = 1:1 divider (max 10V)
-#define VIB_SAMPLES     64
-#define CURR_SAMPLES    300      // more samples = more stable reading
-#define VOLT_SAMPLES    50
-#define SEND_INTERVAL   1000
-#define NOISE_FLOOR     0.01     // currents below this treated as 0
+#define ACS_SENSITIVITY  185.0   // mV/A — change to 100.0 for 20A, 66.0 for 30A
+#define VOLT_DIVIDER     2.0
+#define VIB_SAMPLES      64
+#define CURR_SAMPLES     200
+#define VOLT_SAMPLES     30
+#define SEND_INTERVAL    1000
+#define RECAL_INTERVAL   30      // recalibrate current midpoint every N readings
 
 DHT     dht(DHT_PIN, DHT_TYPE);
 MPU6050 mpu;
 
 float vib_baseline_x = 0, vib_baseline_y = 0, vib_baseline_z = 0;
-float lastGoodTemp       = 25.0;
+float lastGoodTemp        = 25.0;
+float lastGoodCurrent     = 0.0;
 float calibrated_midpoint = 512.0;
-unsigned long lastSendTime = 0;
+
+unsigned long lastSendTime  = 0;
+int           readingCount  = 0;
 
 // ── Calibrate ACS712 zero-current midpoint ───────────────────
-// Run with NO current flowing through sensor
 void calibrateCurrentMidpoint() {
   long sum = 0;
-  for (int i = 0; i < 1000; i++) {
+  const int CAL_SAMPLES = 500;
+  for (int i = 0; i < CAL_SAMPLES; i++) {
     sum += analogRead(ACS_PIN);
-    delayMicroseconds(100);
-    if (i % 200 == 0) wdt_reset();
+    delayMicroseconds(200);
+    if (i % 100 == 0) wdt_reset();
   }
-  calibrated_midpoint = sum / 1000.0;
-  Serial.print("ACS712 midpoint ADC: ");
-  Serial.println(calibrated_midpoint);
+  float newMid = sum / (float)CAL_SAMPLES;
 
-  // Quick sanity check — should be close to 512 (2.5V at 5V supply)
-  float midV = calibrated_midpoint * (5000.0 / 1023.0);
-  Serial.print("ACS712 midpoint mV:  ");
-  Serial.println(midV);
+  // Sanity check — midpoint should be 400–624 (roughly 2.0–3.0V on 5V ADC)
+  if (newMid > 400 && newMid < 624) {
+    calibrated_midpoint = newMid;
+  }
+  // If out of range, keep previous value
 }
 
 void calibrateVibration() {
@@ -85,6 +81,7 @@ void calibrateVibration() {
   vib_baseline_z = sz / 100.0;
 }
 
+// ── Temperature with retry ────────────────────────────────────
 float readTemperatureSafe() {
   for (int attempt = 0; attempt < 3; attempt++) {
     float t = dht.readTemperature();
@@ -98,6 +95,7 @@ float readTemperatureSafe() {
   return lastGoodTemp;
 }
 
+// ── Vibration RMS ─────────────────────────────────────────────
 float readVibration() {
   float sum_sq = 0;
   for (int i = 0; i < VIB_SAMPLES; i++) {
@@ -113,43 +111,41 @@ float readVibration() {
   return max(vib_g_rms * 9.806f, 0.01f);
 }
 
+// ── Current — fixed version ───────────────────────────────────
 float readCurrent() {
-  // ACS712 outputs 2.5V at 0A, shifts by (sensitivity mV) per Amp
-  // Formula: current = (Vout - Vmid) / sensitivity
-  // where Vout = ADC * (5000mV / 1023)
+  float minVal = 9999, maxVal = -9999;
+  float sum = 0;
 
-  float sum_abs = 0;
-
+  // Take CURR_SAMPLES readings as fast as possible (no delay inside)
+  // Fast sampling = better representation of AC component
   for (int i = 0; i < CURR_SAMPLES; i++) {
     int raw = analogRead(ACS_PIN);
-
-    // Convert ADC to millivolts
-    float mV = raw * (5000.0f / 1023.0f);
-
-    // Midpoint in millivolts
+    float mV    = raw * (5000.0f / 1023.0f);
     float midmV = calibrated_midpoint * (5000.0f / 1023.0f);
-
-    // Current in Amps
-    float amps = (mV - midmV) / ACS_SENSITIVITY;
-
-    sum_abs += fabs(amps);
-    delayMicroseconds(100);
+    float amps  = (mV - midmV) / ACS_SENSITIVITY;
+    sum += fabs(amps);
+    if (amps < minVal) minVal = amps;
+    if (amps > maxVal) maxVal = amps;
   }
 
-  float current = sum_abs / CURR_SAMPLES;
+  float avg = sum / CURR_SAMPLES;
 
-  // Debug every reading — open Serial Monitor to verify
-  // Comment these out after confirming values look correct
-  Serial.print("[DBG] raw ADC sample: ");
-  Serial.print(analogRead(ACS_PIN));
-  Serial.print("  midpoint: ");
-  Serial.print(calibrated_midpoint);
-  Serial.print("  current: ");
-  Serial.println(current, 4);
+  // ── Stuck value detector ──────────────────────────────────
+  // If min and max are too close, the ADC is stuck — recalibrate
+  float spread = maxVal - minVal;
+  if (spread < 0.001f) {
+    // ADC frozen — force recalibration and return last good value
+    calibrateCurrentMidpoint();
+    return lastGoodCurrent;
+  }
 
-  return (current < NOISE_FLOOR) ? 0.0f : current;
+  // Apply noise floor
+  float result = (avg < 0.01f) ? 0.0f : avg;
+  lastGoodCurrent = result;
+  return result;
 }
 
+// ── Voltage ───────────────────────────────────────────────────
 float readVoltage() {
   long sum = 0;
   for (int i = 0; i < VOLT_SAMPLES; i++) {
@@ -161,6 +157,7 @@ float readVoltage() {
   return round(voltage * 100.0f) / 100.0f;
 }
 
+// ── Setup ─────────────────────────────────────────────────────
 void setup() {
   wdt_enable(WDTO_8S);
   Serial.begin(9600);
@@ -178,7 +175,7 @@ void setup() {
   delay(2000);
   wdt_reset();
 
-  Serial.println("Calibrating current sensor — keep NO current flowing...");
+  Serial.println("Calibrating current sensor…");
   calibrateCurrentMidpoint();
   wdt_reset();
 
@@ -188,12 +185,21 @@ void setup() {
   Serial.println("READY");
 }
 
+// ── Loop ──────────────────────────────────────────────────────
 void loop() {
   wdt_reset();
 
   unsigned long now = millis();
   if (now - lastSendTime < SEND_INTERVAL) return;
   lastSendTime = now;
+
+  // Recalibrate current midpoint every RECAL_INTERVAL readings
+  // This fixes ADC drift that causes stuck values over time
+  readingCount++;
+  if (readingCount % RECAL_INTERVAL == 0) {
+    calibrateCurrentMidpoint();
+    wdt_reset();
+  }
 
   float temp    = readTemperatureSafe();   wdt_reset();
   float vib     = readVibration();         wdt_reset();
