@@ -1,14 +1,39 @@
-import { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, useRef, Component } from 'react';
 
 const MachineContext = createContext(null);
 
-// ── Simulation engine (runs once, shared globally) ────────────
+// ── Error Boundary ─────────────────────────────────────────────
+export class ErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(e) { return { error: e }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex items-center justify-center h-screen bg-[#10141a] text-[#ffb4ab] p-8 text-center">
+          <div>
+            <div className="text-4xl mb-4">⚠</div>
+            <div className="font-bold text-lg mb-2">System Error</div>
+            <div className="text-sm text-[#849396] max-w-md">{this.state.error?.message}</div>
+            <button onClick={() => window.location.reload()}
+              className="mt-4 px-4 py-2 rounded-lg border border-[#ffb4ab]/30 text-[#ffb4ab] text-sm hover:bg-[#ffb4ab]/10">
+              Reload
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ── Simulation engine ─────────────────────────────────────────
 function useSimEngine() {
   const tickRef     = useRef(0);
   const spikeRef    = useRef(0);
   const stressRef   = useRef(false);
   const rulRef      = useRef(85.0);
   const baselineRef = useRef(null);
+  const latestData  = useRef(null); // always holds latest sim data for calibrate()
 
   const [simData,    setSimData]    = useState(null);
   const [history,    setHistory]    = useState([]);
@@ -62,7 +87,11 @@ function useSimEngine() {
         timestamp:              new Date().toISOString(),
       };
 
+      // Store latest in ref so calibrate() can read without stale closure
+      latestData.current = d;
+
       const ts = new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      // All setState calls are top-level — NOT nested inside each other
       setSimData(d);
       setHistory(h => [...h, { ...d, time: ts }].slice(-150));
       setRul(rulRef.current);
@@ -70,19 +99,18 @@ function useSimEngine() {
     return () => clearInterval(id);
   }, []);
 
+  // calibrate reads from ref — no nested setState needed
   const calibrate = useCallback(() => {
-    setSimData(cur => {
-      if (!cur) return cur;
-      const bl = {
-        current:     cur.spindle_current_a,
-        pressure:    cur.hydraulic_pressure_bar,
-        temperature: cur.temperature_c,
-        voltage:     cur.supply_voltage_v,
-      };
-      baselineRef.current = bl;
-      setBaseline(bl);
-      return cur;
-    });
+    const cur = latestData.current;
+    if (!cur) return;
+    const bl = {
+      current:     cur.spindle_current_a,
+      pressure:    cur.hydraulic_pressure_bar,
+      temperature: cur.temperature_c,
+      voltage:     cur.supply_voltage_v,
+    };
+    baselineRef.current = bl;
+    setBaseline(bl); // plain top-level setState — totally safe
   }, []);
 
   const triggerStressTest = useCallback(() => {
@@ -97,7 +125,11 @@ function useSimEngine() {
     return Math.abs((live - bl[key]) / bl[key]);
   }, []);
 
-  return { simData, history, stressTest, baseline, rul, calibrate, triggerStressTest, getDeviation, isCalibrated: baseline !== null };
+  return {
+    simData, history, stressTest, baseline, rul,
+    calibrate, triggerStressTest, getDeviation,
+    isCalibrated: baseline !== null,
+  };
 }
 
 // ── Provider ──────────────────────────────────────────────────
@@ -108,7 +140,6 @@ export function MachineProvider({ children }) {
   const [initialized,    setInitialized]    = useState(false);
 
   const failureThreshold = machineProfile === 'precision' ? 0.08 : 0.15;
-
   const sim = useSimEngine();
 
   const initMachine = useCallback((profile) => {
@@ -122,10 +153,9 @@ export function MachineProvider({ children }) {
   }, []);
 
   const addDiagnostic = useCallback((entry) => {
-    setDiagnosticsLog(prev => [
-      { ...entry, id: Date.now() + Math.random(), ts: new Date().toISOString() },
-      ...prev,
-    ].slice(0, 50));
+    setDiagnosticsLog(prev =>
+      [{ ...entry, id: Date.now() + Math.random(), ts: new Date().toISOString() }, ...prev].slice(0, 50)
+    );
   }, []);
 
   const triggerEStop = useCallback((reason) => {
@@ -143,9 +173,7 @@ export function MachineProvider({ children }) {
     });
   }, [addDiagnostic]);
 
-  const resetStatus = useCallback(() => {
-    setSystemStatus('ARMED');
-  }, []);
+  const resetStatus = useCallback(() => setSystemStatus('ARMED'), []);
 
   return (
     <MachineContext.Provider value={{
@@ -153,7 +181,6 @@ export function MachineProvider({ children }) {
       failureThreshold, initialized,
       initMachine, setProfile,
       addDiagnostic, triggerEStop, triggerWarning, resetStatus,
-      // Simulation — shared single instance
       sim,
     }}>
       {children}
@@ -167,8 +194,6 @@ export function useMachine() {
   return ctx;
 }
 
-// Convenience hook — just grab sim from context
 export function useSimulation() {
-  const { sim } = useMachine();
-  return sim;
+  return useMachine().sim;
 }
