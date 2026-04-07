@@ -3,9 +3,8 @@ import { createContext, useContext, useState, useCallback } from 'react';
 const MachineContext = createContext(null);
 
 export function MachineProvider({ children }) {
-  const [machineProfile, setMachineProfile] = useState(null); // null = not selected yet
-  const [sensorBaseline, setSensorBaseline] = useState({ current: null, pressure: null, vibration: null, temperature: null, voltage: null });
-  const [systemStatus,   setSystemStatus]   = useState('ARMED'); // 'ARMED' | 'WARNING' | 'ESTOP'
+  const [machineProfile, setMachineProfile] = useState(null);
+  const [systemStatus,   setSystemStatus]   = useState('ARMED');
   const [diagnosticsLog, setDiagnosticsLog] = useState([]);
   const [initialized,    setInitialized]    = useState(false);
 
@@ -17,17 +16,15 @@ export function MachineProvider({ children }) {
     setSystemStatus('ARMED');
   }, []);
 
-  const calibrate = useCallback((liveData) => {
-    setSensorBaseline({
-      current:     liveData.spindle_current_a   ?? null,
-      vibration:   liveData.vibration_rms_mm_s2 ?? null,
-      temperature: liveData.temperature_c        ?? null,
-      voltage:     liveData.supply_voltage_v     ?? null,
-    });
+  const setProfile = useCallback((profile) => {
+    setMachineProfile(profile);
   }, []);
 
   const addDiagnostic = useCallback((entry) => {
-    setDiagnosticsLog(prev => [{ ...entry, id: Date.now(), ts: new Date().toISOString() }, ...prev].slice(0, 50));
+    setDiagnosticsLog(prev => [
+      { ...entry, id: Date.now(), ts: new Date().toISOString() },
+      ...prev,
+    ].slice(0, 50));
   }, []);
 
   const triggerEStop = useCallback((reason) => {
@@ -36,11 +33,14 @@ export function MachineProvider({ children }) {
   }, [addDiagnostic]);
 
   const triggerWarning = useCallback((reason) => {
-    if (systemStatus !== 'ESTOP') {
-      setSystemStatus('WARNING');
-      addDiagnostic({ level: 'WARNING', type: 'warning', message: reason });
-    }
-  }, [systemStatus, addDiagnostic]);
+    setSystemStatus(s => {
+      if (s !== 'ESTOP') {
+        addDiagnostic({ level: 'WARNING', type: 'warning', message: reason });
+        return 'WARNING';
+      }
+      return s;
+    });
+  }, [addDiagnostic]);
 
   const resetStatus = useCallback(() => {
     setSystemStatus('ARMED');
@@ -48,9 +48,10 @@ export function MachineProvider({ children }) {
 
   return (
     <MachineContext.Provider value={{
-      machineProfile, sensorBaseline, systemStatus, diagnosticsLog,
+      machineProfile, systemStatus, diagnosticsLog,
       failureThreshold, initialized,
-      initMachine, calibrate, addDiagnostic, triggerEStop, triggerWarning, resetStatus,
+      initMachine, setProfile,
+      addDiagnostic, triggerEStop, triggerWarning, resetStatus,
     }}>
       {children}
     </MachineContext.Provider>
@@ -59,6 +60,6 @@ export function MachineProvider({ children }) {
 
 export function useMachine() {
   const ctx = useContext(MachineContext);
-  if (!ctx) throw new Error('useMachine must be used inside MachineProvider');
+  if (!ctx) throw new Error('useMachine must be inside MachineProvider');
   return ctx;
 }
