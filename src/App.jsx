@@ -1,5 +1,6 @@
+import { MachineProvider, ErrorBoundary } from './context/MachineContext';
 import { useState } from 'react';
-import { MachineProvider, useMachine } from './context/MachineContext';
+import { useMachine } from './context/MachineContext';
 import Sidebar from './components/Sidebar';
 import InitModal from './components/InitModal';
 import Dashboard from './pages/Dashboard';
@@ -34,11 +35,13 @@ function AppShell() {
   };
 
   return (
-    <div className="flex h-screen bg-[#10141a] text-[#dfe2eb] overflow-hidden dark">
-      {!initialized && <InitModal/>}
-      <Sidebar current={page} onChange={setPage}/>
-      <main className="flex-1 overflow-y-auto scrollbar-thin">
-        {renderPage()}
+    <div className="flex h-screen bg-[#10141a] text-[#dfe2eb] overflow-hidden">
+      {!initialized && <InitModal />}
+      <Sidebar current={page} onChange={setPage} />
+      <main className="flex-1 overflow-y-auto">
+        <ErrorBoundary>
+          {renderPage()}
+        </ErrorBoundary>
       </main>
     </div>
   );
@@ -46,8 +49,10 @@ function AppShell() {
 
 export default function App() {
   return (
-    <MachineProvider>
-      <AppShell/>
-    </MachineProvider>
+    <ErrorBoundary>
+      <MachineProvider>
+        <AppShell />
+      </MachineProvider>
+    </ErrorBoundary>
   );
 }
