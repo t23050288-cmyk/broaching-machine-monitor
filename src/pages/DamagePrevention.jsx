@@ -1,281 +1,236 @@
 import { useState, useEffect, useRef } from 'react';
-import { ShieldAlert, Zap, Gauge, Activity, RotateCcw, AlertTriangle, CheckCircle2, Cpu } from 'lucide-react';
+import { useMachine } from '../context/MachineContext';
+import { useSimulation } from '../hooks/useSimulation';
+import { Target, ShieldAlert, CheckCircle2, Zap, FlaskConical, RotateCcw, Activity } from 'lucide-react';
+import LiveChart from '../components/LiveChart';
 
-// ── Animated progress bar ─────────────────────────────────────
-function ParamBar({ label, value, max, unit, color, threshold, devPct }) {
-  const pct      = Math.min(100, (value / max) * 100);
-  const threshPx = Math.min(100, ((1 + devPct / 100) * (max * 0.5)) / max * 100); // threshold line position
-  const exceeded = value > max * 0.5 * (1 + devPct / 100);
+// ── Virtual Relay visual ──────────────────────────────────────
+function VirtualRelay({ open }) {
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between text-xs">
-        <span className="text-slate-400 font-medium">{label}</span>
-        <span className={`font-black text-base ${exceeded ? 'text-amber-400' : 'text-emerald-400'}`}>
-          {value.toFixed(1)} <span className="text-slate-500 text-xs font-normal">{unit}</span>
-        </span>
+    <div className={`rounded-xl p-5 border transition-all duration-500 ${open ? 'bg-[#93000a]/20 border-[#ffb4ab]/40' : 'bg-[#181c22] border-[#3b494c]/20'}`}>
+      <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4 flex items-center gap-2">
+        <Zap size={12} style={{ color: open ? '#ffb4ab' : '#00e5ff' }}/>
+        Virtual Relay — Spindle Power Circuit
       </div>
-      <div className="relative h-3 bg-slate-800 rounded-full overflow-visible border border-slate-700">
-        {/* Fill */}
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{ width: `${pct}%`, background: exceeded ? '#f59e0b' : color }}
-        />
-        {/* Threshold line */}
-        <div
-          className="absolute top-0 h-full w-0.5 bg-red-500 opacity-70"
-          style={{ left: `${threshPx}%` }}
-          title={`Threshold: ${devPct}% deviation`}
-        />
+      <div className="flex items-center justify-center gap-4 py-2">
+        {/* Power source */}
+        <div className="text-center">
+          <div className={`w-12 h-12 rounded-full border-2 flex items-center justify-center mx-auto mb-2 transition-all
+            ${open ? 'border-[#3b494c]/40 bg-[#3b494c]/10' : 'border-[#00e5ff]/50 bg-[#00e5ff]/10'}`}>
+            <Zap size={18} style={{ color: open ? '#3b494c' : '#00e5ff' }}/>
+          </div>
+          <div className="text-[9px] uppercase tracking-wider" style={{ color: open ? '#3b494c' : '#00e5ff' }}>POWER</div>
+        </div>
+        {/* Wire segment 1 */}
+        <div className="flex items-center gap-0.5">
+          {[...Array(6)].map((_, i) => (
+            <div key={i} className={`w-3 h-1 rounded-sm transition-all ${open ? 'bg-[#ffb4ab]' : 'bg-[#00e5ff]'}`}/>
+          ))}
+        </div>
+        {/* Relay switch */}
+        <div className={`relative w-14 h-10 rounded-lg border-2 flex items-center justify-center transition-all
+          ${open ? 'bg-[#93000a]/30 border-[#ffb4ab]/50' : 'bg-[#00e5ff]/10 border-[#00e5ff]/30'}`}>
+          <div className={`text-[8px] font-black uppercase tracking-wider transition-all
+            ${open ? 'text-[#ffb4ab]' : 'text-[#00e5ff]'}`}>
+            {open ? 'OPEN' : 'CLOSED'}
+          </div>
+          {/* Switch arm */}
+          <div className={`absolute bottom-1 left-1/2 -translate-x-1/2 w-6 h-0.5 rounded transition-all duration-500 origin-left
+            ${open ? 'bg-[#ffb4ab] rotate-[-30deg]' : 'bg-[#00e5ff] rotate-0'}`}/>
+        </div>
+        {/* Wire segment 2 */}
+        <div className="flex items-center gap-0.5">
+          {[...Array(6)].map((_, i) => (
+            <div key={i} className={`w-3 h-1 rounded-sm transition-all ${open ? 'bg-[#3b494c]' : 'bg-[#00e5ff]'}`}/>
+          ))}
+        </div>
+        {/* Load (spindle) */}
+        <div className="text-center">
+          <div className={`w-12 h-12 rounded-full border-2 flex items-center justify-center mx-auto mb-2 transition-all
+            ${open ? 'border-[#3b494c]/40 bg-[#3b494c]/10' : 'border-[#00e5ff]/50 bg-[#00e5ff]/10'}`}>
+            <Activity size={18} style={{ color: open ? '#3b494c' : '#00e5ff' }}/>
+          </div>
+          <div className="text-[9px] uppercase tracking-wider" style={{ color: open ? '#3b494c' : '#00e5ff' }}>SPINDLE</div>
+        </div>
       </div>
-      <div className="flex justify-between text-[10px] text-slate-600">
-        <span>0</span>
-        <span className="text-red-500/70">▲ +{devPct}% threshold</span>
-        <span>{max} {unit}</span>
+      <div className={`text-center text-[10px] font-bold uppercase tracking-wider mt-2 transition-all
+        ${open ? 'text-[#ffb4ab]' : 'text-[#00e5ff]'}`}>
+        {open ? '⚡ Circuit OPEN — Spindle power isolated' : '✓ Circuit CLOSED — Normal operation'}
       </div>
     </div>
   );
 }
 
-// ── Logic gate display ────────────────────────────────────────
-function LogicGate({ triggered, count }) {
+// ── E-Stop overlay specific to this page ──────────────────────
+function ChipPackingOverlay({ active, onReset }) {
+  if (!active) return null;
   return (
-    <div className={`rounded-xl border-2 p-4 transition-all duration-500 ${
-      triggered
-        ? 'border-amber-500 bg-amber-500/10 shadow-lg shadow-amber-500/20'
-        : 'border-slate-700 bg-slate-800/50'
-    }`}>
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <Cpu size={16} className={triggered ? 'text-amber-400' : 'text-slate-500'}/>
-          <span className="text-xs font-bold uppercase tracking-widest text-slate-400">5–10% Logic Gate</span>
+    <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-auto">
+      <div className="absolute inset-0 bg-[#93000a]/50 animate-pulse"/>
+      <div className="absolute inset-0 border-8 border-[#ffb4ab]/80 animate-pulse"/>
+      <div className="relative z-10 bg-[#0a0d12]/95 backdrop-blur-md border-2 border-[#ffb4ab]/60 rounded-2xl p-8 max-w-lg mx-4 text-center shadow-2xl">
+        <div className="text-6xl mb-3 animate-bounce">🛑</div>
+        <div className="text-[11px] uppercase tracking-[0.35em] text-[#ffb4ab] mb-2">Autonomous Shutdown</div>
+        <h2 className="text-3xl font-black font-headline text-[#ffb4ab] mb-4 leading-tight">
+          CHIP PACKING<br/>DETECTED
+        </h2>
+        <div className="bg-[#181c22] rounded-xl p-4 border border-[#ffb4ab]/20 text-left mb-5 space-y-2">
+          <div className="text-[9px] uppercase tracking-wider text-[#849396]">AI Diagnosis</div>
+          <div className="text-sm text-[#dfe2eb]">Combined load spike exceeded threshold on <b>both Current and Pressure</b> simultaneously.</div>
+          <div className="text-[11px] text-[#ffb4ab] font-bold">Probable cause: Chip packing / tool friction buildup</div>
+          <div className="text-[11px] text-[#ffba38]">Action: Stop, clear chips, inspect tool edge. Regrind if worn.</div>
         </div>
-        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-          triggered
-            ? 'text-amber-400 bg-amber-400/10 border-amber-400/30'
-            : 'text-emerald-400 bg-emerald-400/10 border-emerald-400/30'
-        }`}>
-          {triggered ? 'TRIGGERED' : 'NOMINAL'}
-        </span>
-      </div>
-      <div className="flex items-center gap-3">
-        {[0,1,2].map(i => (
-          <div key={i} className={`flex-1 h-8 rounded-lg flex items-center justify-center text-xs font-bold border transition-all duration-300 ${
-            i < count
-              ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
-              : 'bg-slate-700/50 border-slate-700 text-slate-600'
-          }`}>
-            {i < count ? '⚡ HI' : '— LO'}
-          </div>
-        ))}
-      </div>
-      <div className="mt-3 text-[11px] text-slate-500 text-center">
-        {count} / 3 parameters exceeded · {triggered ? '≥2 triggers correlation rule' : 'Need ≥2 to trigger'}
-      </div>
-      {triggered && (
-        <div className="mt-3 flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2">
-          <AlertTriangle size={14} className="text-amber-400 animate-pulse flex-shrink-0"/>
-          <span className="text-xs font-bold text-amber-300">Potential Chip Packing Detected</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Hard Stop Relay ───────────────────────────────────────────
-function RelayStatus({ tripped }) {
-  return (
-    <div className={`rounded-xl border-2 p-6 transition-all duration-500 ${
-      tripped
-        ? 'border-red-500 bg-red-500/10 shadow-xl shadow-red-500/30 animate-pulse'
-        : 'border-emerald-600/50 bg-emerald-500/5'
-    }`}>
-      <div className="flex items-center justify-between">
-        <div>
-          <div className="text-[10px] uppercase tracking-[0.25em] text-slate-500 mb-1">Hard-Stop Relay</div>
-          <div className={`text-2xl font-black uppercase tracking-wider ${tripped ? 'text-red-400' : 'text-emerald-400'}`}>
-            {tripped ? 'RELAY TRIPPED' : 'SYSTEM ARMED'}
-          </div>
-          <div className={`text-sm mt-1 font-medium ${tripped ? 'text-red-300' : 'text-emerald-600'}`}>
-            {tripped ? 'MACHINE HALTED — Awaiting reset' : 'All parameters within safe limits'}
-          </div>
-        </div>
-        <div className={`w-16 h-16 rounded-full border-4 flex items-center justify-center flex-shrink-0 ${
-          tripped
-            ? 'border-red-500 bg-red-500/20'
-            : 'border-emerald-500 bg-emerald-500/10'
-        }`}>
-          {tripped
-            ? <ShieldAlert size={28} className="text-red-400"/>
-            : <CheckCircle2 size={28} className="text-emerald-400"/>
-          }
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── Main Component ────────────────────────────────────────────
-export default function DamagePrevention() {
-  const [sensitivity, setSensitivity] = useState(10);
-  const [relayTripped, setRelayTripped] = useState(false);
-  const [resetKey, setResetKey] = useState(0);
-
-  // Live simulated sensor values
-  const [current,  setCurrent]  = useState(12.4);
-  const [pressure, setPressure] = useState(82.0);
-  const [torque,   setTorque]   = useState(45.0);
-
-  // Baselines (normal operating values)
-  const BASE_CURR = 12.0;
-  const BASE_PRES = 80.0;
-  const BASE_TORQ = 44.0;
-  const MAX_CURR  = 25;
-  const MAX_PRES  = 160;
-  const MAX_TORQ  = 90;
-
-  // Simulate live fluctuating values
-  useEffect(() => {
-    if (relayTripped) return;
-    const id = setInterval(() => {
-      // Mean-reverting simulation: always pulled back toward baseline + small noise
-      const revert = 0.15; // pull strength toward baseline
-      setCurrent(v  => parseFloat((Math.max(0, v + revert*(12.0 - v) + (Math.random()-0.5)*0.6)).toFixed(2)));
-      setPressure(v => parseFloat((Math.max(0, v + revert*(80.0 - v) + (Math.random()-0.5)*1.2)).toFixed(2)));
-      setTorque(v   => parseFloat((Math.max(0, v + revert*(44.0 - v) + (Math.random()-0.5)*0.8)).toFixed(2)));
-    }, 800);
-    return () => clearInterval(id);
-  }, [relayTripped, resetKey]);
-
-  // Check thresholds
-  const currExceeded = current  > BASE_CURR * (1 + sensitivity / 100);
-  const presExceeded = pressure > BASE_PRES * (1 + sensitivity / 100);
-  const torqExceeded = torque   > BASE_TORQ * (1 + sensitivity / 100);
-  const exceedCount  = [currExceeded, presExceeded, torqExceeded].filter(Boolean).length;
-  const correlated   = exceedCount >= 2;
-
-  // Auto-trip relay when correlated
-  useEffect(() => {
-    if (correlated && !relayTripped) setRelayTripped(true);
-  }, [correlated]);
-
-  const handleReset = () => {
-    setRelayTripped(false);
-    setCurrent(BASE_CURR);
-    setPressure(BASE_PRES);
-    setTorque(BASE_TORQ);
-    setResetKey(k => k + 1);
-  };
-
-  return (
-    <div className="min-h-screen bg-slate-900 p-6 space-y-6">
-
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-black text-white tracking-tight flex items-center gap-3">
-            <ShieldAlert size={26} className="text-amber-400"/>
-            Active Damage Prevention System
-          </h1>
-          <p className="text-slate-500 text-sm mt-1">Real-time correlation monitoring · Random Forest decision engine</p>
-        </div>
-        <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-bold ${
-          relayTripped
-            ? 'border-red-500/50 bg-red-500/10 text-red-400'
-            : 'border-emerald-600/30 bg-emerald-500/5 text-emerald-400'
-        }`}>
-          <div className={`w-2 h-2 rounded-full ${relayTripped ? 'bg-red-500 animate-ping' : 'bg-emerald-500'}`}/>
-          {relayTripped ? 'FAULT DETECTED' : 'MONITORING ACTIVE'}
-        </div>
-      </div>
-
-      {/* Relay Status */}
-      <RelayStatus tripped={relayTripped}/>
-
-      {/* Threshold + Correlation Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-        {/* Threshold Config */}
-        <div className="bg-slate-800 rounded-xl border border-slate-700 p-5 space-y-5">
-          <div className="flex items-center gap-2">
-            <Gauge size={16} className="text-slate-400"/>
-            <span className="text-xs uppercase tracking-widest font-bold text-slate-400">Threshold Configuration</span>
-          </div>
-          <div>
-            <div className="flex items-center justify-between mb-4">
-              <span className="text-sm text-slate-300 font-medium">Deviation Sensitivity</span>
-              <span className="text-lg font-black text-amber-400 bg-amber-400/10 border border-amber-400/30 px-3 py-0.5 rounded-full">
-                {sensitivity}%
-              </span>
-            </div>
-            <input
-              type="range" min={5} max={20} step={1}
-              value={sensitivity}
-              onChange={e => setSensitivity(Number(e.target.value))}
-              className="w-full h-2 rounded-full appearance-none cursor-pointer"
-              style={{
-                background: `linear-gradient(to right, #f59e0b ${((sensitivity-5)/15)*100}%, #334155 ${((sensitivity-5)/15)*100}%)`
-              }}
-            />
-            <div className="flex justify-between text-[10px] text-slate-600 mt-1.5">
-              <span>5% — Very Sensitive</span>
-              <span>20% — Fault Tolerant</span>
-            </div>
-          </div>
-
-          <div className="bg-slate-900/60 rounded-lg p-3 border border-slate-700">
-            <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-2">Threshold Baseline</div>
-            <div className="grid grid-cols-3 gap-2 text-xs">
-              {[
-                { l: 'Current', v: (BASE_CURR*(1+sensitivity/100)).toFixed(1), u: 'A' },
-                { l: 'Pressure', v: (BASE_PRES*(1+sensitivity/100)).toFixed(1), u: 'Bar' },
-                { l: 'Torque', v: (BASE_TORQ*(1+sensitivity/100)).toFixed(1), u: 'Nm' },
-              ].map(({ l, v, u }) => (
-                <div key={l} className="text-center">
-                  <div className="text-slate-500">{l}</div>
-                  <div className="text-amber-400 font-bold">{v} <span className="text-slate-600">{u}</span></div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* Logic Gate */}
-        <div className="bg-slate-800 rounded-xl border border-slate-700 p-5 space-y-4">
-          <div className="flex items-center gap-2">
-            <Cpu size={16} className="text-slate-400"/>
-            <span className="text-xs uppercase tracking-widest font-bold text-slate-400">Correlation Engine</span>
-          </div>
-          <LogicGate triggered={correlated} count={exceedCount}/>
-        </div>
-      </div>
-
-      {/* Correlation Status */}
-      <div className="bg-slate-800 rounded-xl border border-slate-700 p-5 space-y-6">
-        <div className="flex items-center gap-2">
-          <Activity size={16} className="text-slate-400"/>
-          <span className="text-xs uppercase tracking-widest font-bold text-slate-400">Correlation Status — Live Parameters</span>
-          <span className="ml-auto text-[10px] text-slate-600 animate-pulse">● LIVE</span>
-        </div>
-        <div className="space-y-6">
-          <ParamBar label="Motor Current (Amps)"      value={current}  max={MAX_CURR}  unit="A"   color="#10b981" threshold devPct={sensitivity} />
-          <ParamBar label="Hydraulic Pressure (Bar)"  value={pressure} max={MAX_PRES}  unit="Bar" color="#3b82f6" threshold devPct={sensitivity} />
-          <ParamBar label="Spindle Torque (Nm)"       value={torque}   max={MAX_TORQ}  unit="Nm"  color="#8b5cf6" threshold devPct={sensitivity} />
-        </div>
-      </div>
-
-      {/* Reset Button */}
-      <div className="flex justify-center">
-        <button
-          onClick={handleReset}
-          className="flex items-center gap-3 px-8 py-4 rounded-xl font-black text-sm uppercase tracking-widest
-            bg-slate-700 hover:bg-slate-600 text-slate-200 border border-slate-600 hover:border-slate-500
-            transition-all duration-200 active:scale-95 shadow-lg"
-        >
-          <RotateCcw size={18} className="text-emerald-400"/>
-          System Reset &amp; Re-calibrate
+        <button onClick={onReset}
+          className="w-full py-3.5 rounded-xl font-bold text-sm border border-[#ffb4ab]/40 text-[#ffb4ab] hover:bg-[#ffb4ab]/10 transition-colors">
+          <RotateCcw size={14} className="inline mr-2"/>Reset &amp; Resume
         </button>
       </div>
+    </div>
+  );
+}
 
+export default function DamagePrevention() {
+  const { failureThreshold, systemStatus, triggerEStop, triggerWarning, resetStatus } = useMachine();
+  const { data, history, stressTest, baseline, rul, calibrate, triggerStressTest, getDeviation, isCalibrated } = useSimulation();
+  const prevBoth = useRef(false);
+
+  const currDev  = isCalibrated ? getDeviation('current',  data?.spindle_current_a       ?? 0) : 0;
+  const pressDev = isCalibrated ? getDeviation('pressure',  data?.hydraulic_pressure_bar  ?? 0) : 0;
+  const bothExceed = currDev > failureThreshold && pressDev > failureThreshold;
+
+  useEffect(() => {
+    if (!isCalibrated) return;
+    if (bothExceed && !prevBoth.current && systemStatus !== 'ESTOP') {
+      triggerEStop('Chip Packing Detected — Current & Pressure combined spike. Autonomous shutdown triggered.');
+    }
+    prevBoth.current = bothExceed;
+  }, [bothExceed, isCalibrated, systemStatus]);
+
+  const isEStop = systemStatus === 'ESTOP';
+
+  const bars = [
+    { label: 'Motor Current', dev: currDev, val: data?.spindle_current_a?.toFixed(4), unit: 'A', color: '#818cf8', base: baseline?.current?.toFixed(4) },
+    { label: 'Hyd. Pressure', dev: pressDev, val: data?.hydraulic_pressure_bar?.toFixed(2), unit: 'bar', color: '#ff9259', base: baseline?.pressure?.toFixed(2) },
+  ];
+
+  return (
+    <div className="p-6 space-y-6 max-w-4xl">
+      <ChipPackingOverlay active={isEStop} onReset={resetStatus}/>
+
+      {/* Header */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight flex items-center gap-2">
+            <ShieldAlert size={22} className="text-amber-400"/> Damage Prevention
+          </h1>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">
+            Fused Correlation Engine · {(failureThreshold * 100).toFixed(0)}% threshold
+          </div>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={calibrate}
+            className={`flex items-center gap-2 text-xs px-4 py-2.5 rounded-xl border font-bold transition-all
+              ${isCalibrated
+                ? 'bg-[#00e5ff]/10 border-[#00e5ff]/30 text-[#00e5ff] hover:bg-[#00e5ff]/20'
+                : 'bg-[#c084fc]/10 border-[#c084fc]/40 text-[#c084fc] hover:bg-[#c084fc]/20'}`}>
+            <Target size={13}/>{isCalibrated ? '✓ Re-Calibrate' : 'Calibrate Baseline'}
+          </button>
+          <button onClick={triggerStressTest} disabled={stressTest}
+            className={`flex items-center gap-2 text-xs px-4 py-2.5 rounded-xl border font-bold transition-all
+              ${stressTest ? 'bg-[#ffb4ab]/20 border-[#ffb4ab]/50 text-[#ffb4ab] cursor-not-allowed animate-pulse' : 'bg-[#ffb4ab]/10 border-[#ffb4ab]/30 text-[#ffb4ab] hover:bg-[#ffb4ab]/20'}`}>
+            <FlaskConical size={13}/>{stressTest ? 'Spike Running…' : 'Trigger Stress Test'}
+          </button>
+        </div>
+      </div>
+
+      {/* Baseline info */}
+      {isCalibrated && (
+        <div className="bg-[#0d1f0d]/60 border border-[#00e5ff]/20 rounded-xl px-4 py-3 flex items-center gap-2 text-xs">
+          <CheckCircle2 size={14} className="text-[#00e5ff]"/>
+          <span className="text-[#00e5ff] font-bold">Baseline Calibrated</span>
+          <span className="text-[#849396] ml-2">
+            Current: {baseline?.current?.toFixed(4)} A · Pressure: {baseline?.pressure?.toFixed(2)} bar
+          </span>
+        </div>
+      )}
+      {!isCalibrated && (
+        <div className="bg-[#ffba38]/5 border border-[#ffba38]/20 rounded-xl px-4 py-3 text-xs text-[#ffba38]">
+          ⚠ Calibrate first to activate the Fused Correlation Engine and deviation tracking.
+        </div>
+      )}
+
+      {/* Logic Gate Visual */}
+      <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
+        <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mb-4 flex items-center gap-2">
+          <Target size={12} className="text-[#c084fc]"/> Correlation Logic Gate
+        </div>
+        <div className="space-y-4">
+          {bars.map(b => {
+            const exceeds = b.dev > failureThreshold;
+            const pct = Math.min(100, (b.dev / (failureThreshold * 1.5)) * 100);
+            return (
+              <div key={b.label}>
+                <div className="flex items-center justify-between text-[9px] mb-2">
+                  <span className="text-[#849396] uppercase tracking-wider font-bold">{b.label}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[#3b494c]">base: {isCalibrated ? b.base : '—'} {b.unit}</span>
+                    <span className="text-[#849396]">live: {b.val} {b.unit}</span>
+                    <span style={{ color: exceeds ? '#ffb4ab' : b.color }}
+                      className={`font-black text-xs ${exceeds ? 'animate-pulse' : ''}`}>
+                      {isCalibrated ? `${(b.dev * 100).toFixed(1)}%` : '—'}
+                      {exceeds && ' ▲ EXCEEDED'}
+                    </span>
+                  </div>
+                </div>
+                <div className="relative h-6 bg-[#10141a] rounded-full overflow-hidden border border-[#3b494c]/20">
+                  <div className="absolute inset-y-0 left-0 rounded-full transition-all duration-300 flex items-center justify-end pr-2"
+                    style={{
+                      width: isCalibrated ? `${pct}%` : '0%',
+                      background: exceeds
+                        ? 'linear-gradient(90deg,#991b1b,#ffb4ab)'
+                        : `linear-gradient(90deg,${b.color}44,${b.color})`,
+                      boxShadow: exceeds ? '0 0 12px #ff444466' : 'none',
+                    }}>
+                    {pct > 20 && (
+                      <span className="text-[8px] font-bold" style={{ color: exceeds ? '#ffb4ab' : '#10141a' }}>
+                        {isCalibrated ? `${(b.dev * 100).toFixed(1)}%` : ''}
+                      </span>
+                    )}
+                  </div>
+                  {/* Threshold line */}
+                  <div className="absolute top-0 bottom-0 w-0.5 bg-[#ffba38]"
+                    style={{ left: `${(failureThreshold / (failureThreshold * 1.5)) * 100}%` }}>
+                    <div className="absolute -top-0.5 -left-3 text-[8px] text-[#ffba38] whitespace-nowrap">
+                      {(failureThreshold * 100).toFixed(0)}%
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {/* AND gate result */}
+        <div className={`mt-5 rounded-xl p-4 border text-center transition-all duration-500
+          ${bothExceed ? 'bg-[#93000a]/20 border-[#ffb4ab]/40' : isCalibrated ? 'bg-[#0d1f0d]/30 border-[#00e5ff]/15' : 'bg-[#1c2026] border-[#3b494c]/20'}`}>
+          <div className="text-[9px] uppercase tracking-[0.2em] text-[#849396] mb-1">AND Gate Output</div>
+          <div className="text-lg font-black" style={{ color: bothExceed ? '#ffb4ab' : isCalibrated ? '#00e5ff' : '#3b494c' }}>
+            {bothExceed ? '⚡ BOTH EXCEEDED → E-STOP TRIGGERED' : isCalibrated ? '✓ Normal — No correlation spike' : '— Awaiting calibration'}
+          </div>
+        </div>
+      </div>
+
+      {/* Virtual Relay */}
+      <VirtualRelay open={isEStop}/>
+
+      {/* Mini charts */}
+      <div className="grid grid-cols-2 gap-4">
+        <div className="bg-[#1c2026] rounded-xl p-4">
+          <LiveChart data={history} dataKey="spindle_current_a" color="#818cf8" label="Current (A)" height={120}/>
+        </div>
+        <div className="bg-[#1c2026] rounded-xl p-4">
+          <LiveChart data={history} dataKey="hydraulic_pressure_bar" color="#ff9259" label="Pressure (bar)" height={120}/>
+        </div>
+      </div>
     </div>
   );
 }
