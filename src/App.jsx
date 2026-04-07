@@ -1,5 +1,7 @@
 import { useState } from 'react';
+import { MachineProvider, useMachine } from './context/MachineContext';
 import Sidebar from './components/Sidebar';
+import InitModal from './components/InitModal';
 import Dashboard from './pages/Dashboard';
 import Performance from './pages/Performance';
 import Inventory from './pages/Inventory';
@@ -9,9 +11,9 @@ import SettingsPage from './pages/Settings';
 import AiPredictor from './pages/AiPredictor';
 import Chatbot from './pages/Chatbot';
 import SensorReadings from './pages/SensorReadings';
-import DamagePrevention from './pages/DamagePrevention';
 
-export default function App() {
+function AppShell() {
+  const { initialized } = useMachine();
   const [page, setPage] = useState('dashboard');
 
   const renderPage = () => {
@@ -25,17 +27,25 @@ export default function App() {
       case 'predictor':   return <AiPredictor />;
       case 'chatbot':     return <Chatbot />;
       case 'readings':    return <SensorReadings />;
-      case 'damage':      return <DamagePrevention />;
       default:            return <Dashboard />;
     }
   };
 
   return (
     <div className="flex h-screen bg-[#10141a] text-[#dfe2eb] overflow-hidden dark">
+      {!initialized && <InitModal/>}
       <Sidebar current={page} onChange={setPage}/>
       <main className="flex-1 overflow-y-auto scrollbar-thin">
         {renderPage()}
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <MachineProvider>
+      <AppShell/>
+    </MachineProvider>
   );
 }
