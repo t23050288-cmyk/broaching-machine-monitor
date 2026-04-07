@@ -1,56 +1,30 @@
-import { useState, useEffect } from 'react';
-import { Wifi, WifiOff, Usb, AlertTriangle, RefreshCw } from 'lucide-react';
+import { Wifi, WifiOff, Terminal, RefreshCw } from 'lucide-react';
+import { connectBridge } from '../utils/sensorBridge';
 
-export default function ConnectionBanner({ status, onConnect }) {
-  const [trying, setTrying] = useState(false);
-
-  // Auto-retry when disconnected
-  useEffect(() => {
-    if (status === 'disconnected') {
-      const t = setTimeout(() => {
-        onConnect && onConnect();
-      }, 3000);
-      return () => clearTimeout(t);
-    }
-  }, [status]);
-
-  async function handleConnect() {
-    setTrying(true);
-    try { await onConnect(); } finally { setTrying(false); }
-  }
-
+export default function ConnectionBanner({ status }) {
   if (status === 'connected') {
     return (
       <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#00e5ff]/5 border border-[#00e5ff]/20 text-[#00e5ff] text-xs font-bold">
         <Wifi size={13} className="animate-pulse"/>
-        <span>LIVE — Arduino Sensors Connected</span>
-      </div>
-    );
-  }
-
-  if (status === 'unsupported') {
-    return (
-      <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#ffb4ab]/10 border border-[#ffb4ab]/20 text-[#ffb4ab] text-xs">
-        <AlertTriangle size={13}/>
-        <span>Web Serial not supported. Use <strong>Chrome</strong> or <strong>Edge</strong> browser.</span>
+        <span>LIVE — Arduino Sensors Connected via Bridge</span>
       </div>
     );
   }
 
   return (
-    <div className="flex items-center justify-between px-4 py-2.5 rounded-xl bg-[#1c2026] border border-[#3b494c]/30">
+    <div className="flex items-center justify-between px-4 py-2.5 rounded-xl bg-[#1c2026] border border-[#ffba38]/20">
       <div className="flex items-center gap-2 text-xs text-[#849396]">
-        <WifiOff size={13}/>
-        <span>
-          {status === 'connecting' ? 'Connecting to Arduino…' : 'Arduino not connected — click Connect to start live monitoring'}
-        </span>
+        <WifiOff size={13} className="text-[#ffba38]"/>
+        <span className="text-[#ffba38] font-bold">Bridge Offline</span>
+        <span className="text-[#849396]">— Run this in terminal to connect:</span>
+        <code className="bg-[#10141a] px-2 py-0.5 rounded text-[#00e5ff] font-mono text-[10px]">
+          python sensor_bridge.py
+        </code>
       </div>
-      <button onClick={handleConnect} disabled={trying || status === 'connecting'}
+      <button onClick={() => connectBridge()}
         className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-bold transition-all
-          bg-[#00e5ff]/10 border border-[#00e5ff]/20 text-[#00e5ff] hover:bg-[#00e5ff]/20 disabled:opacity-50">
-        {trying || status === 'connecting'
-          ? <><RefreshCw size={11} className="animate-spin"/> Connecting…</>
-          : <><Usb size={11}/> Connect Arduino</>}
+          bg-[#ffba38]/10 border border-[#ffba38]/30 text-[#ffba38] hover:bg-[#ffba38]/20">
+        <RefreshCw size={11}/> Retry
       </button>
     </div>
   );

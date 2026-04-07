@@ -1,14 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { connectBridge, disconnectBridge, onReading } from '../utils/sensorBridge';
+import { connectBridge, onReading } from '../utils/sensorBridge';
 import { saveReading, getSettings, saveAlert, getReadings } from '../utils/storage';
 import { checkThresholds, alarmBeep } from '../utils/alerts';
 import { pushToCloud } from '../utils/cloudSync';
 
-/**
- * useSensorData v3.0 — Web Serial API
- * No auto-connect. User clicks "Connect Arduino" to start.
- * Status: disconnected | connecting | connected | error | unsupported
- */
 export function useSensorData() {
   const [bridgeStatus, setBridgeStatus] = useState('disconnected');
   const [latest,       setLatest]       = useState(null);
@@ -17,6 +12,11 @@ export function useSensorData() {
   const [isFlashing,   setIsFlashing]   = useState(false);
   const syncTimer  = useRef(null);
   const flashTimer = useRef(null);
+
+  // Auto-connect on mount
+  useEffect(() => {
+    connectBridge();
+  }, []);
 
   // Cloud sync
   useEffect(() => {
@@ -29,12 +29,11 @@ export function useSensorData() {
     return () => clearInterval(syncTimer.current);
   }, []);
 
-  // Listen for readings & status from the serial bridge
+  // Listen for readings & status
   useEffect(() => {
     const unsub = onReading((msg) => {
       if (msg.type === 'status') {
         setBridgeStatus(msg.status);
-        // When disconnected, don't clear the last reading — keep showing it
         return;
       }
 
@@ -58,6 +57,7 @@ export function useSensorData() {
         setActiveAlerts(prev => [...thresh, ...prev].slice(0, 50));
       }
 
+      // Freeze values on disconnect — only update when connected
       setLatest(reading);
       const time = new Date(reading.timestamp).toLocaleTimeString('en', {
         hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -71,11 +71,7 @@ export function useSensorData() {
     };
   }, []);
 
-  const connect    = () => connectBridge();
-  const disconnect = () => {
-    disconnectBridge();
-    setBridgeStatus('disconnected');
-  };
+  const connect = () => connectBridge();
 
-  return { bridgeStatus, latest, chartData, activeAlerts, isFlashing, connect, disconnect };
+  return { bridgeStatus, latest, chartData, activeAlerts, isFlashing, connect };
 }
