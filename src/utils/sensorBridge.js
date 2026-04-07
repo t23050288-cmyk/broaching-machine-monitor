@@ -1,23 +1,28 @@
 /**
- * sensorBridge.js v3.0 — Web Serial API (NO Python bridge needed)
- * Browser talks directly to Arduino over USB. No terminal, no Python.
- * Works in Chrome/Edge only (Web Serial API).
+ * sensorBridge.js v4.1 — Web Serial API with full error reporting
+ * Works in Chrome/Edge on HTTPS (GitHub Pages qualifies).
+ * Falls back to WebSocket (Python bridge) if Web Serial fails.
  */
 
 const BAUD_RATE = 9600;
-let port = null, reader = null, status = 'disconnected', stopping = false;
+const WS_FALLBACK = 'ws://localhost:8765';
+
+let port = null, reader = null, ws = null;
+let status = 'disconnected', stopping = false, mode = null;
 const listeners = new Set();
 
-function notifyAll(msg) { listeners.forEach(fn => fn(msg)); }
+function notifyAll(msg) { listeners.forEach(fn => { try { fn(msg); } catch(_){} }); }
 export function getBridgeStatus() { return status; }
 export function onReading(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 export function onChatReply(fn) { return () => {}; }
 export function sendChatMessage() {}
 
-// Parse Arduino serial line
+// ── Parse Arduino serial line ─────────────────────────────────
 function parseLine(line) {
   line = line.trim();
-  if (!line || line.startsWith('[DBG]') || line === 'READY' || line.startsWith('ACS') || line.startsWith('Calibr') || line.startsWith('MPU')) return null;
+  if (!line) return null;
+  // Skip debug/info lines
+  if (/^\[DBG\]|^READY|^ACS|^Calibr|^MPU|^Broach/i.test(line)) return null;
   try {
     const tM = line.match(/TEMP[:\s]+([-\d.]+)/i);
     const vM = line.match(/VIB[:\s]+([-\d.]+)/i);
@@ -31,15 +36,11 @@ function parseLine(line) {
         supply_voltage_v:    uM ? parseFloat(uM[1]) : null,
       };
     }
-    const parts = line.split(',').map(p => parseFloat(p.trim()));
-    if (parts.length >= 3 && parts.every(p => !isNaN(p))) {
-      return { temperature_c: parts[0], vibration_rms_mm_s2: parts[1], spindle_current_a: parts[2], supply_voltage_v: parts[3] ?? null };
-    }
   } catch (_) {}
   return null;
 }
 
-// Kalman filter
+// ── Kalman filter ─────────────────────────────────────────────
 function makeKalman(q = 0.01, r = 0.5) {
   let x = null, p = 1;
   return (z) => {
@@ -50,8 +51,8 @@ function makeKalman(q = 0.01, r = 0.5) {
   };
 }
 
-const FFT_WINDOW = 32;
 const vibBuffer = [];
+const FFT_WINDOW = 32;
 let cycleCount = 0, cumDamage = 0;
 const damageHistory = [];
 const kTemp = makeKalman(0.01, 0.5), kVib = makeKalman(0.05, 1.0), kCurr = makeKalman(0.01, 0.3), kVolt = makeKalman(0.005, 0.1);
@@ -64,9 +65,9 @@ function dominantFreq(buffer) {
   let best = null, bestMag = 0;
   for (let k = 1; k < n / 2; k++) {
     let re = 0, im = 0;
-    for (let i = 0; i < n; i++) { re += dc[i] * Math.cos(2 * Math.PI * k * i / n); im += dc[i] * Math.sin(2 * Math.PI * k * i / n); }
-    const mag = Math.sqrt(re * re + im * im);
-    if (mag > bestMag) { bestMag = mag; best = k / n; }
+    for (let i = 0; i < n; i++) { re += dc[i] * Math.cos(2*Math.PI*k*i/n); im += dc[i] * Math.sin(2*Math.PI*k*i/n); }
+    const mag = Math.sqrt(re*re + im*im);
+    if (mag > bestMag) { bestMag = mag; best = k/n; }
   }
   return best !== null ? Math.round(best * 1000) / 1000 : null;
 }
@@ -88,39 +89,40 @@ function processRaw(raw) {
   if (vibBuffer.length > FFT_WINDOW * 2) vibBuffer.shift();
   const domFreq = dominantFreq(vibBuffer);
   const st = toolStatus(temp, vib, curr);
-  const wear = Math.min(1.5, Math.max(0, (vib - 6) / 31 * 1.5));
+  const wear = Math.min(1.5, Math.max(0, (vib - 0.5) / 8.0 * 1.5));
   const dpCycle = { new: 0.01, worn: 0.05, failed: 0.20 }[st] ?? 0.02;
   cumDamage = Math.min(100, cumDamage + dpCycle);
   cycleCount++;
   damageHistory.push(dpCycle);
   if (damageHistory.length > 60) damageHistory.shift();
-  const avgRate = damageHistory.reduce((a, b) => a + b, 0) / damageHistory.length || 0.02;
+  const avgRate = damageHistory.reduce((a,b) => a+b, 0) / damageHistory.length || 0.02;
   const remainPct = Math.max(0, 100 - cumDamage);
   const cyclesLeft = avgRate > 0 ? Math.round(remainPct / avgRate) : 5000;
-  const h = Math.floor(cyclesLeft / 3600), m = Math.floor((cyclesLeft % 3600) / 60);
+  const h = Math.floor(cyclesLeft/3600), m = Math.floor((cyclesLeft%3600)/60);
   const timeLeft = h > 0 ? `${h}h ${m}m` : `${m}m`;
   return {
     timestamp: new Date().toISOString(), cycle: cycleCount,
-    temperature_c: Math.round(temp * 100) / 100,
-    vibration_rms_mm_s2: Math.round(vib * 1000) / 1000,
-    spindle_current_a: Math.round(curr * 1000) / 1000,
-    supply_voltage_v: volt != null ? Math.round(volt * 1000) / 1000 : null,
-    dominant_freq_hz: domFreq,
-    tool_status: st, tool_id: 'TB001', tool_material: 'Carbide', coating: 'TiN',
-    remaining_life_pct: Math.round(remainPct * 10) / 10,
-    cycles_remaining: cyclesLeft,
-    estimated_time_left: timeLeft,
-    wear_progression: Math.round(wear * 1000) / 1000,
-    cutting_force_n: Math.round(Math.max(2500, Math.min(11500, curr * 240 + vib * 15 + (temp - 77) * 50)) * 10) / 10,
-    acoustic_emission_db: Math.round(Math.max(300, Math.min(650, curr * 12 + vib * 2.5 + 200)) * 10) / 10,
-    coolant_flow_lmin: Math.round(Math.max(0, 18 + (temp - 77) * 0.2) * 10) / 10,
+    temperature_c:        Math.round(temp * 100) / 100,
+    vibration_rms_mm_s2:  Math.round(vib * 1000) / 1000,
+    spindle_current_a:    Math.round(curr * 1000) / 1000,
+    supply_voltage_v:     volt != null ? Math.round(volt * 1000) / 1000 : null,
+    dominant_freq_hz:     domFreq,
+    tool_status:          st, tool_id: 'TB001', tool_material: 'Carbide', coating: 'TiN',
+    remaining_life_pct:   Math.round(remainPct * 10) / 10,
+    cycles_remaining:     cyclesLeft,
+    estimated_time_left:  timeLeft,
+    wear_progression:     Math.round(wear * 1000) / 1000,
+    cutting_force_n:      Math.round(Math.max(2500, Math.min(11500, curr*240 + vib*15 + (temp-77)*50)) * 10) / 10,
+    acoustic_emission_db: Math.round(Math.max(300, Math.min(650, curr*12 + vib*2.5 + 200)) * 10) / 10,
+    coolant_flow_lmin:    Math.round(Math.max(0, 18 + (temp-77)*0.2) * 10) / 10,
     surface_finish_ra_um: st === 'new' ? 0.5 : st === 'worn' ? 0.8 : 1.2,
   };
 }
 
-async function startReadLoop() {
+// ── Web Serial read loop ──────────────────────────────────────
+async function startSerialReadLoop() {
   const textDecoder = new TextDecoderStream();
-  const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+  const closed = port.readable.pipeTo(textDecoder.writable);
   reader = textDecoder.readable.getReader();
   let buffer = '';
   try {
@@ -135,39 +137,99 @@ async function startReadLoop() {
         if (raw) notifyAll({ type: 'reading', data: processRaw(raw) });
       }
     }
-  } catch (e) { if (!stopping) console.warn('Serial read error:', e); }
-  finally {
-    try { reader.releaseLock(); } catch (_) {}
-    try { await readableStreamClosed; } catch (_) {}
+  } catch (e) {
+    if (!stopping) console.error('[Serial] Read loop error:', e);
+  } finally {
+    try { reader.releaseLock(); } catch(_) {}
+    try { await closed; } catch(_) {}
+    if (!stopping) {
+      status = 'disconnected';
+      notifyAll({ type: 'status', status: 'disconnected' });
+    }
   }
 }
 
-export async function connectBridge() {
-  if (!('serial' in navigator)) { notifyAll({ type: 'status', status: 'unsupported' }); return; }
-  if (port && port.readable) return;
-  try {
-    status = 'connecting';
-    notifyAll({ type: 'status', status: 'connecting' });
-    const ports = await navigator.serial.getPorts();
-    port = ports.length > 0 ? ports[0] : await navigator.serial.requestPort();
-    await port.open({ baudRate: BAUD_RATE });
+// ── WebSocket fallback (Python bridge) ───────────────────────
+function startWebSocket() {
+  mode = 'websocket';
+  console.log('[Bridge] Trying WebSocket fallback:', WS_FALLBACK);
+  ws = new WebSocket(WS_FALLBACK);
+  ws.onopen = () => {
     status = 'connected';
-    notifyAll({ type: 'status', status: 'connected' });
-    stopping = false;
-    startReadLoop().then(() => {
-      if (!stopping) { status = 'disconnected'; notifyAll({ type: 'status', status: 'disconnected' }); }
-    });
-  } catch (e) {
-    status = 'disconnected';
-    notifyAll({ type: 'status', status: 'disconnected' });
-    console.warn('Serial connect error:', e);
+    notifyAll({ type: 'status', status: 'connected', via: 'websocket' });
+    console.log('[Bridge] WebSocket connected');
+  };
+  ws.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.type === 'reading') notifyAll({ type: 'reading', data: processRaw(d.data) });
+      else if (d.type === 'status') notifyAll(d);
+    } catch(_) {}
+  };
+  ws.onerror = (e) => { console.warn('[Bridge] WebSocket error:', e); };
+  ws.onclose = () => {
+    if (!stopping) {
+      status = 'disconnected';
+      notifyAll({ type: 'status', status: 'disconnected' });
+    }
+  };
+}
+
+// ── Main connect ──────────────────────────────────────────────
+export async function connectBridge() {
+  if (status === 'connected' || status === 'connecting') return;
+  stopping = false;
+
+  // Try Web Serial first
+  if ('serial' in navigator) {
+    console.log('[Bridge] Web Serial API available — requesting port…');
+    try {
+      status = 'connecting';
+      notifyAll({ type: 'status', status: 'connecting' });
+
+      // Check if we already have permission to a port
+      const existingPorts = await navigator.serial.getPorts();
+      console.log('[Bridge] Existing authorized ports:', existingPorts.length);
+
+      port = existingPorts.length > 0
+        ? existingPorts[0]
+        : await navigator.serial.requestPort();  // shows picker
+
+      console.log('[Bridge] Port selected, opening at', BAUD_RATE, 'baud…');
+      await port.open({ baudRate: BAUD_RATE });
+
+      mode = 'serial';
+      status = 'connected';
+      notifyAll({ type: 'status', status: 'connected', via: 'serial' });
+      console.log('[Bridge] Serial port open — reading data…');
+      startSerialReadLoop();
+      return;
+    } catch (e) {
+      console.error('[Bridge] Web Serial failed:', e.name, e.message);
+      port = null;
+      // Fall through to WebSocket
+    }
+  } else {
+    console.warn('[Bridge] Web Serial API not available in this browser');
   }
+
+  // Try WebSocket fallback
+  console.log('[Bridge] Falling back to WebSocket (Python bridge)…');
+  startWebSocket();
 }
 
 export async function disconnectBridge() {
   stopping = true;
-  try { if (reader) reader.cancel(); } catch (_) {}
-  try { if (port) await port.close(); } catch (_) {}
-  port = null; reader = null; status = 'disconnected';
+  if (mode === 'serial') {
+    try { if (reader) await reader.cancel(); } catch(_) {}
+    try { if (port) await port.close(); } catch(_) {}
+    port = null; reader = null;
+  }
+  if (mode === 'websocket') {
+    try { if (ws) ws.close(); } catch(_) {}
+    ws = null;
+  }
+  mode = null;
+  status = 'disconnected';
   notifyAll({ type: 'status', status: 'disconnected' });
 }
