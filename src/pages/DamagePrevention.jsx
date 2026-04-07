@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { useMachine } from '../context/MachineContext';
-import { useSimulation } from '../hooks/useSimulation';
+import { useMachine, useSimulation } from '../context/MachineContext';
 import { Target, ShieldAlert, CheckCircle2, Zap, FlaskConical, RotateCcw, Activity } from 'lucide-react';
 import LiveChart from '../components/LiveChart';
 
