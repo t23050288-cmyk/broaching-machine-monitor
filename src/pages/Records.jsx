@@ -1,92 +1,92 @@
-import { useState, useEffect } from 'react';
-import { getReadings, exportToCSV, clearOldReadings } from '../utils/storage';
-import StatusBadge from '../components/StatusBadge';
-import { Download, Trash2, Database } from 'lucide-react';
+import { useState } from 'react';
+import { useSimulation } from '../context/MachineContext';
+import { Download, Database } from 'lucide-react';
 
 const COLS = [
-  ['timestamp','Time'],['tool_id','Tool'],['temperature_c','Temp °C'],
-  ['vibration_rms_mm_s2','Vib mm/s²'],['spindle_current_a','Current A'],
-  ['cutting_force_n','Force N'],['acoustic_emission_db','AE dB'],
-  ['wear_progression','Wear'],['tool_status','Status']
+  ['time','Time'], ['T1','Temp T1°C'], ['vibAvg','Vib Avg'], ['V1','V1'], ['V2','V2'], ['V3','V3'],
+  ['L1','Load L1N'], ['L2','L2'], ['A1','Acoustic dB'],
+  ['spindle_current_a','Current A'], ['hydraulic_pressure_bar','Pressure bar'],
+  ['spindle_torque_nm','Torque N·m'], ['P2','Voltage V'], ['wear_progression','Wear Idx'],
+  ['remaining_life_pct','RUL%'], ['tool_status','Status'],
 ];
 
+function exportCSV(rows) {
+  const header = COLS.map(c => c[1]).join(',');
+  const body   = rows.map(r => COLS.map(([k]) => r[k] ?? '').join(',')).join('\n');
+  const blob   = new Blob([header + '\n' + body], { type: 'text/csv' });
+  const url    = URL.createObjectURL(blob);
+  const a      = document.createElement('a');
+  a.href = url; a.download = `zenith_18param_${Date.now()}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function Records() {
-  const [readings, setReadings] = useState([]);
-  const [filter, setFilter] = useState('all');
+  const { history } = useSimulation();
+  const [search, setSearch] = useState('');
 
-  useEffect(() => {
-    const load = () => setReadings(getReadings().slice().reverse());
-    load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
-  }, []);
-
-  const filtered = filter === 'all' ? readings : readings.filter(r => r.tool_status === filter);
-  const storageSize = (JSON.stringify(readings).length / 1024).toFixed(1);
+  const rows = history.filter(r =>
+    !search || r.tool_status?.includes(search) || r.time?.includes(search)
+  ).slice().reverse();
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 space-y-4 min-h-screen">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Data Records</h1>
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">
-            {readings.length} readings · {storageSize} KB stored on this device
-          </div>
+          <h1 className="text-2xl font-black text-slate-100">Data Records</h1>
+          <p className="text-xs text-slate-500 mt-0.5">18-parameter CSV export · {history.length} records</p>
         </div>
         <div className="flex items-center gap-2">
-          <select value={filter} onChange={e => setFilter(e.target.value)}
-            className="bg-[#1c2026] border border-[#3b494c]/30 text-[#dfe2eb] text-xs rounded-xl px-3 py-2">
-            <option value="all">All</option>
-            <option value="new">New</option>
-            <option value="worn">Worn</option>
-            <option value="failed">Failed</option>
-          </select>
-          <button onClick={() => exportToCSV(filtered.length ? filtered : readings)}
-            className="flex items-center gap-2 text-xs bg-[#00e5ff]/10 hover:bg-[#00e5ff]/20 text-[#00e5ff] border border-[#00e5ff]/20 px-3 py-2 rounded-xl transition-colors">
-            <Download size={13}/> Export CSV
-          </button>
-          <button onClick={() => { clearOldReadings(); setReadings(getReadings().slice().reverse()); }}
-            className="flex items-center gap-2 text-xs text-[#849396] hover:text-[#ffb4ab] border border-[#3b494c]/30 px-3 py-2 rounded-xl transition-colors">
-            <Trash2 size={13}/> Clean Old
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter…"
+            className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 outline-none focus:border-sky-500/50 w-32"/>
+          <button onClick={() => exportCSV(history)}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl border border-emerald-500/40 text-emerald-400 text-xs font-bold hover:bg-emerald-500/10 transition-all">
+            <Download size={12}/> Export CSV (18 params)
           </button>
         </div>
       </div>
-      <div className="bg-[#181c22] rounded-xl overflow-hidden">
+
+      <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full text-xs">
+          <table className="w-full text-xs min-w-max">
             <thead>
-              <tr className="border-b border-[#3b494c]/15">
-                {COLS.map(([k, label]) => (
-                  <th key={k} className="text-left px-4 py-3 text-[9px] uppercase tracking-[0.15em] text-[#849396] font-medium whitespace-nowrap">{label}</th>
+              <tr className="border-b border-slate-700 bg-slate-900/50">
+                {COLS.map(([k, l]) => (
+                  <th key={k} className="text-left py-2.5 px-3 text-[9px] text-slate-500 uppercase tracking-wider whitespace-nowrap">{l}</th>
                 ))}
               </tr>
             </thead>
-            <tbody>
-              {filtered.slice(0, 200).map((r, i) => (
-                <tr key={i} className="border-b border-[#3b494c]/10 hover:bg-[#1c2026] transition-colors">
-                  <td className="px-4 py-2 text-[#849396] whitespace-nowrap">{new Date(r.timestamp).toLocaleString()}</td>
-                  <td className="px-4 py-2 text-[#dfe2eb]">{r.tool_id}</td>
-                  <td className={`px-4 py-2 font-mono font-bold ${r.temperature_c > 85 ? 'text-[#ffb4ab]' : 'text-[#c3f5ff]'}`}>{r.temperature_c?.toFixed(1)}</td>
-                  <td className={`px-4 py-2 font-mono font-bold ${r.vibration_rms_mm_s2 > 32 ? 'text-[#ffb4ab]' : 'text-[#c3f5ff]'}`}>{r.vibration_rms_mm_s2?.toFixed(2)}</td>
-                  <td className={`px-4 py-2 font-mono font-bold ${r.spindle_current_a > 44 ? 'text-[#ffb4ab]' : 'text-[#c3f5ff]'}`}>{r.spindle_current_a?.toFixed(2)}</td>
-                  <td className="px-4 py-2 font-mono text-[#ffd799]">{r.cutting_force_n?.toFixed(0)}</td>
-                  <td className="px-4 py-2 font-mono text-[#9cf0ff]">{r.acoustic_emission_db?.toFixed(1)}</td>
-                  <td className="px-4 py-2 font-mono text-[#ffba38]">{r.wear_progression?.toFixed(3)}</td>
-                  <td className="px-4 py-2"><StatusBadge status={r.tool_status}/></td>
+            <tbody className="divide-y divide-slate-700/30">
+              {rows.slice(0, 100).map((r, i) => (
+                <tr key={i} className="hover:bg-slate-700/20 transition-colors">
+                  {COLS.map(([k]) => {
+                    const v = r[k];
+                    const isStatus = k === 'tool_status';
+                    return (
+                      <td key={k} className="py-2 px-3 whitespace-nowrap">
+                        {isStatus ? (
+                          <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full
+                            ${v === 'new' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                            {v}
+                          </span>
+                        ) : (
+                          <span className="text-slate-300">
+                            {typeof v === 'number' ? v.toFixed(k.startsWith('L') ? 0 : 3) : v ?? '—'}
+                          </span>
+                        )}
+                      </td>
+                    );
+                  })}
                 </tr>
               ))}
-              {filtered.length === 0 && (
-                <tr><td colSpan={9} className="text-center py-12 text-[#849396]">
-                  <Database size={24} className="mx-auto mb-2 opacity-30"/>
-                  No records yet. Connect sensors to start recording.
-                </td></tr>
-              )}
             </tbody>
           </table>
         </div>
-      </div>
-      <div className="text-[10px] text-[#3b494c] text-center">
-        Stored in browser localStorage on this device. Normal readings older than 24h auto-clean. Anomalies kept 7 days.
+        {rows.length === 0 && (
+          <div className="flex flex-col items-center py-12 text-slate-500">
+            <Database size={28} className="mb-2 opacity-30"/>
+            <div className="text-sm">Collecting data…</div>
+          </div>
+        )}
       </div>
     </div>
   );

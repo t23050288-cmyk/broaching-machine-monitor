@@ -1,119 +1,73 @@
 import { useState } from 'react';
 import { useMachine } from '../context/MachineContext';
-import { Shield, Cpu, ChevronRight, AlertTriangle } from 'lucide-react';
+import { Shield, Cpu, Zap, ChevronRight } from 'lucide-react';
 
 export default function InitModal() {
   const { initMachine } = useMachine();
   const [selected, setSelected] = useState(null);
-  const [step, setStep] = useState(1); // 1=select profile, 2=confirm
 
   const profiles = [
-    {
-      id: 'legacy',
-      label: 'Legacy Machine',
-      sub: '20+ Years — High Mechanical Play',
-      threshold: '15%',
-      desc: 'Higher tolerance for natural wear & mechanical deviation. Alerts trigger at 15% deviation from baseline.',
-      color: '#ffba38',
-      icon: Shield,
-    },
-    {
-      id: 'precision',
-      label: 'Precision CNC',
-      sub: 'New / High-Accuracy Build',
-      threshold: '8%',
-      desc: 'Tight tolerances. Any deviation is significant. Alerts trigger at 8% deviation — early intervention mode.',
-      color: '#00e5ff',
-      icon: Cpu,
-    },
+    { id: 'legacy',    label: 'Legacy Machine',   sub: '20+ yrs — High mechanical play', threshold: '15%', color: 'amber',   Icon: Shield },
+    { id: 'precision', label: 'Precision CNC',     sub: 'New / High-accuracy build',      threshold: '8%',  color: 'emerald', Icon: Cpu   },
+    { id: 'broach',    label: 'Broaching Machine', sub: 'High-force linear cutting',      threshold: '10%', color: 'sky',     Icon: Zap   },
   ];
 
+  const colorMap = {
+    amber:   { border: 'border-amber-500/50',   bg: 'bg-amber-500/10',   text: 'text-amber-400'   },
+    emerald: { border: 'border-emerald-500/50', bg: 'bg-emerald-500/10', text: 'text-emerald-400' },
+    sky:     { border: 'border-sky-500/50',     bg: 'bg-sky-500/10',     text: 'text-sky-400'     },
+  };
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0a0d12]/95 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/95 backdrop-blur-sm">
       <div className="w-full max-w-lg mx-4">
-        {/* Logo / Title */}
         <div className="text-center mb-8">
-          <div className="text-[10px] uppercase tracking-[0.3em] text-[#849396] mb-2">KINETIC FORGE</div>
-          <h1 className="text-3xl font-black font-headline text-[#c3f5ff] tracking-tight">Adaptive Command Center</h1>
-          <div className="text-sm text-[#849396] mt-2">Select your machine profile to initialize monitoring</div>
+          <div className="inline-flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/30 rounded-full px-4 py-1.5 mb-4">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"/>
+            <span className="text-[10px] uppercase tracking-widest text-emerald-400 font-bold">Project Zenith — ADPS v3.0</span>
+          </div>
+          <h1 className="text-3xl font-black text-slate-100 tracking-tight">Active Damage Prevention System</h1>
+          <p className="text-slate-400 text-sm mt-2">Select machine profile to initialize 18-sensor monitoring</p>
         </div>
 
-        {step === 1 && (
-          <div className="space-y-3">
-            {profiles.map(p => {
-              const Icon = p.icon;
-              const isSelected = selected === p.id;
-              return (
-                <button key={p.id} onClick={() => setSelected(p.id)}
-                  className={`w-full text-left p-5 rounded-2xl border-2 transition-all duration-200
-                    ${isSelected
-                      ? 'border-current bg-opacity-10'
-                      : 'border-[#3b494c]/30 bg-[#181c22] hover:border-[#3b494c]/60'}`}
-                  style={isSelected ? { borderColor: p.color, backgroundColor: p.color + '10' } : {}}>
-                  <div className="flex items-start gap-4">
-                    <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
-                      style={{ backgroundColor: p.color + '15', border: `1px solid ${p.color}30` }}>
-                      <Icon size={20} style={{ color: p.color }}/>
-                    </div>
-                    <div className="flex-1">
-                      <div className="flex items-center justify-between">
-                        <div className="font-bold text-[#dfe2eb] text-sm">{p.label}</div>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-                          style={{ color: p.color, backgroundColor: p.color + '15', border: `1px solid ${p.color}30` }}>
-                          {p.threshold} THRESHOLD
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-[#849396] mt-0.5">{p.sub}</div>
-                      <div className="text-[11px] text-[#6b7280] mt-2 leading-relaxed">{p.desc}</div>
-                    </div>
+        <div className="space-y-3">
+          {profiles.map(({ id, label, sub, threshold, color, Icon }) => {
+            const c = colorMap[color];
+            const isSelected = selected === id;
+            return (
+              <button key={id} onClick={() => setSelected(id)}
+                className={`w-full text-left p-4 rounded-xl border-2 transition-all
+                  ${isSelected ? `${c.border} ${c.bg}` : 'border-slate-700 bg-slate-800/50 hover:border-slate-600'}`}>
+                <div className="flex items-center gap-4">
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${isSelected ? c.bg : 'bg-slate-700/50'}`}>
+                    <Icon size={18} className={isSelected ? c.text : 'text-slate-400'}/>
                   </div>
-                </button>
-              );
-            })}
+                  <div className="flex-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-slate-100 text-sm">{label}</span>
+                      <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${c.bg} ${c.text} border ${c.border}`}>
+                        {threshold} THRESHOLD
+                      </span>
+                    </div>
+                    <div className="text-xs text-slate-400 mt-0.5">{sub}</div>
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
 
-            <button
-              onClick={() => selected && setStep(2)}
-              disabled={!selected}
-              className={`w-full py-3.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all mt-4
-                ${selected
-                  ? 'bg-[#00e5ff]/10 border border-[#00e5ff]/30 text-[#00e5ff] hover:bg-[#00e5ff]/20'
-                  : 'bg-[#1c2026] border border-[#3b494c]/20 text-[#3b494c] cursor-not-allowed'}`}>
-              Continue <ChevronRight size={16}/>
-            </button>
-          </div>
-        )}
+        <button onClick={() => selected && initMachine(selected)} disabled={!selected}
+          className={`w-full mt-4 py-3.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all
+            ${selected ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30'
+                       : 'bg-slate-800 border border-slate-700 text-slate-500 cursor-not-allowed'}`}>
+          Initialize System <ChevronRight size={16}/>
+        </button>
 
-        {step === 2 && (() => {
-          const p = profiles.find(x => x.id === selected);
-          return (
-            <div className="bg-[#181c22] rounded-2xl p-6 border border-[#3b494c]/20 space-y-5">
-              <div className="flex items-center gap-3">
-                <AlertTriangle size={18} className="text-[#ffba38]"/>
-                <div className="text-sm font-bold text-[#dfe2eb]">Confirm Initialization</div>
-              </div>
-              <div className="bg-[#10141a] rounded-xl p-4 border border-[#3b494c]/20">
-                <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-2">Selected Profile</div>
-                <div className="font-bold text-[#dfe2eb]" style={{ color: p.color }}>{p.label}</div>
-                <div className="text-xs text-[#849396] mt-1">Failure threshold set to <b style={{ color: p.color }}>{p.threshold}</b> deviation</div>
-              </div>
-              <div className="text-xs text-[#849396] leading-relaxed">
-                The Fused Correlation Engine will monitor live sensor data against this threshold.
-                An E-Stop will be triggered if multiple sensors simultaneously exceed the limit.
-              </div>
-              <div className="flex gap-3">
-                <button onClick={() => setStep(1)}
-                  className="flex-1 py-3 rounded-xl border border-[#3b494c]/30 text-[#849396] text-sm hover:text-[#dfe2eb] hover:border-[#3b494c]/60 transition-colors">
-                  Back
-                </button>
-                <button onClick={() => initMachine(selected)}
-                  className="flex-1 py-3 rounded-xl font-bold text-sm transition-all"
-                  style={{ backgroundColor: p.color + '20', borderWidth: 1, borderColor: p.color + '50', color: p.color }}>
-                  Initialize System
-                </button>
-              </div>
-            </div>
-          );
-        })()}
+        <div className="mt-4 flex items-center justify-center gap-2 text-[10px] text-slate-500">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"/>
+          Industrial Hardening Active: Teflon (PTFE) Shielded Data Stream
+        </div>
       </div>
     </div>
   );

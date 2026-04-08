@@ -1,77 +1,116 @@
 import { useState, useEffect } from 'react';
-import StatusBadge from '../components/StatusBadge';
-import { getReadings } from '../utils/storage';
-import { Package } from 'lucide-react';
+import { useSimulation } from '../context/MachineContext';
+import { Package, AlertTriangle, CheckCircle, Clock } from 'lucide-react';
 
 const TOOLS = [
-  { id: 'TB001', material: 'Carbide',    coating: 'TiN',   maxCycles: 2000, maxHours: 50 },
-  { id: 'TB002', material: 'Coated HSS', coating: 'None',  maxCycles: 1800, maxHours: 45 },
-  { id: 'TB003', material: 'Coated HSS', coating: 'TiAlN', maxCycles: 2200, maxHours: 55 },
-  { id: 'TB004', material: 'HSS',        coating: 'TiN',   maxCycles: 1500, maxHours: 40 },
+  { id: 'TB001', material: 'Carbide',    coating: 'TiN',   maxCycles: 2000, maxHours: 50, installed: '2026-04-01' },
+  { id: 'TB002', material: 'Coated HSS', coating: 'None',  maxCycles: 1800, maxHours: 45, installed: '2026-03-28' },
+  { id: 'TB003', material: 'Carbide',    coating: 'TiAlN', maxCycles: 2500, maxHours: 65, installed: '2026-04-05' },
+  { id: 'TB004', material: 'CBN',        coating: 'DLC',   maxCycles: 3000, maxHours: 80, installed: '2026-04-06' },
 ];
 
 export default function Inventory() {
-  const [latestByTool, setLatestByTool] = useState({});
+  const { data } = useSimulation();
+  const [cycles, setCycles] = useState({ TB001: 420, TB002: 1650, TB003: 80, TB004: 15 });
 
   useEffect(() => {
-    const load = () => {
-      const readings = getReadings();
-      const byTool = {};
-      readings.forEach(r => { if (r.tool_id) byTool[r.tool_id] = r; });
-      setLatestByTool(byTool);
-    };
-    load();
-    const t = setInterval(load, 3000);
-    return () => clearInterval(t);
+    const id = setInterval(() => {
+      setCycles(prev => ({ ...prev, TB001: Math.min(prev.TB001 + 0.05, 2000) }));
+    }, 2000);
+    return () => clearInterval(id);
   }, []);
 
+  const rulPct = (tool) => {
+    const pct = Math.max(0, 100 - (cycles[tool.id] / tool.maxCycles) * 100);
+    return parseFloat(pct.toFixed(1));
+  };
+
+  const rulColor = pct => pct > 50 ? 'text-emerald-400' : pct > 20 ? 'text-amber-400' : 'text-red-400';
+  const rulBarColor = pct => pct > 50 ? '#34d399' : pct > 20 ? '#f59e0b' : '#f87171';
+  const recommendation = pct => pct < 10 ? '⚠ Replace Immediately' : pct < 25 ? '🔧 Sharpening Required' : pct < 50 ? '📋 Schedule Maintenance' : '✅ Within Service Life';
+
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 space-y-5 min-h-screen">
       <div>
-        <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Tool Inventory</h1>
-        <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">Real-time tool health overview</div>
+        <h1 className="text-2xl font-black text-slate-100">Tool Inventory & RUL</h1>
+        <p className="text-xs text-slate-500 mt-0.5">Remaining Useful Life tracker · Cycle-based degradation model</p>
       </div>
+
+      {/* Active tool highlight */}
+      {data && (
+        <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 flex items-center gap-4">
+          <div className="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+            <Package size={20} className="text-emerald-400"/>
+          </div>
+          <div>
+            <div className="text-xs text-slate-500 uppercase tracking-wider">Currently Active</div>
+            <div className="font-black text-slate-100">TB001 — Carbide / TiN</div>
+            <div className="text-xs text-slate-400 mt-0.5">
+              Wear Index: <span className="text-amber-400 font-bold">{data.wear_progression.toFixed(3)}</span> ·
+              Cycles: <span className="text-sky-400 font-bold">{Math.round(cycles.TB001)}</span> ·
+              RUL: <span className={rulColor(rulPct(TOOLS[0]))}>{rulPct(TOOLS[0])}%</span>
+            </div>
+          </div>
+          <div className="ml-auto text-sm font-bold text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-1.5">
+            {recommendation(rulPct(TOOLS[0]))}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {TOOLS.map(tool => {
-          const latest = latestByTool[tool.id];
-          const wearPct = latest ? Math.min(1, (latest.wear_progression || 0) / 1.5) : 0;
-          const status = latest?.tool_status || 'new';
+          const pct = rulPct(tool);
+          const cyc = Math.round(cycles[tool.id] || 0);
+          const rec = recommendation(pct);
+          const isAlarm = pct < 10;
+          const isWarn  = pct < 25 && pct >= 10;
+
           return (
-            <div key={tool.id} className={`bg-[#1c2026] rounded-xl p-5 border transition-all
-              ${status === 'failed' ? 'border-[#ffb4ab]/20 glow-red' : status === 'worn' ? 'border-[#ffba38]/20 glow-amber' : 'border-[#3b494c]/15 glow-cyan'}`}>
+            <div key={tool.id}
+              className={`bg-slate-800/50 rounded-xl border p-5 transition-all
+                ${isAlarm ? 'border-red-500/50' : isWarn ? 'border-amber-500/40' : 'border-slate-700/40'}`}>
               <div className="flex items-start justify-between mb-4">
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-[#181c22] flex items-center justify-center">
-                    <Package size={14} className="text-[#00daf3]"/>
+                <div>
+                  <div className="flex items-center gap-2">
+                    {isAlarm ? <AlertTriangle size={14} className="text-red-400"/> :
+                     isWarn  ? <AlertTriangle size={14} className="text-amber-400"/> :
+                               <CheckCircle  size={14} className="text-emerald-400"/>}
+                    <span className="font-black text-slate-100 text-sm">{tool.id}</span>
                   </div>
-                  <div>
-                    <div className="font-bold font-headline text-[#dfe2eb]">{tool.id}</div>
-                    <div className="text-[9px] text-[#849396] uppercase tracking-wider">{tool.material} · {tool.coating}</div>
-                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5">{tool.material} · {tool.coating} coating</div>
                 </div>
-                <StatusBadge status={status}/>
+                <div className="text-right">
+                  <div className={`text-2xl font-black ${rulColor(pct)}`}>{pct.toFixed(0)}%</div>
+                  <div className="text-[9px] text-slate-500">RUL</div>
+                </div>
               </div>
-              {latest ? (
-                <div className="space-y-3">
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <div><div className="text-[9px] text-[#849396]">Temp</div><div className="font-bold text-[#c3f5ff]">{latest.temperature_c?.toFixed(1)}°C</div></div>
-                    <div><div className="text-[9px] text-[#849396]">Vibration</div><div className="font-bold text-[#c3f5ff]">{latest.vibration_rms_mm_s2?.toFixed(1)}</div></div>
-                    <div><div className="text-[9px] text-[#849396]">Current</div><div className="font-bold text-[#c3f5ff]">{latest.spindle_current_a?.toFixed(1)}A</div></div>
+
+              {/* RUL bar */}
+              <div className="h-3 bg-slate-700 rounded-full overflow-hidden mb-3">
+                <div className="h-full rounded-full transition-all duration-1000"
+                  style={{ width: `${pct}%`, backgroundColor: rulBarColor(pct) }}/>
+              </div>
+
+              {/* Stats */}
+              <div className="grid grid-cols-3 gap-2 mb-3">
+                {[
+                  ['Cycles Used', `${cyc}/${tool.maxCycles}`],
+                  ['Hours Used',  `${(cyc/40).toFixed(0)}/${tool.maxHours}h`],
+                  ['Installed',   tool.installed],
+                ].map(([l, v]) => (
+                  <div key={l} className="bg-slate-900/50 rounded-lg p-2">
+                    <div className="text-[8px] text-slate-600 uppercase tracking-wider">{l}</div>
+                    <div className="text-[10px] font-bold text-slate-300 mt-0.5">{v}</div>
                   </div>
-                  <div>
-                    <div className="flex justify-between text-[9px] mb-1">
-                      <span className="text-[#849396] uppercase tracking-wider">Wear Index</span>
-                      <span className="text-[#ffba38]">{(wearPct * 100).toFixed(0)}%</span>
-                    </div>
-                    <div className="h-1.5 bg-[#31353c] rounded-full overflow-hidden">
-                      <div className="h-full rounded-full transition-all" style={{ width: `${wearPct * 100}%`, background: wearPct > 0.9 ? '#ffb4ab' : wearPct > 0.7 ? '#ffba38' : '#00daf3' }}/>
-                    </div>
-                  </div>
-                  <div className="text-[9px] text-[#3b494c]">Last: {new Date(latest.timestamp).toLocaleTimeString()}</div>
-                </div>
-              ) : (
-                <div className="text-xs text-[#3b494c] text-center py-4">No sensor data yet — connect device</div>
-              )}
+                ))}
+              </div>
+
+              <div className={`text-[10px] font-bold py-1.5 px-3 rounded-lg text-center
+                ${isAlarm ? 'bg-red-500/10 text-red-400 border border-red-500/30' :
+                  isWarn  ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30' :
+                            'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'}`}>
+                {rec}
+              </div>
             </div>
           );
         })}

@@ -1,190 +1,124 @@
-import { useState, useEffect, useRef } from 'react';
-import { useMachine, useSimulation } from '../context/MachineContext';
-import GaugeCircle from '../components/GaugeCircle';
-import LiveChart from '../components/LiveChart';
-import StatusBadge from '../components/StatusBadge';
-import SystemStatusBar from '../components/SystemStatusBar';
-import {
-  Thermometer, Battery, Target, CheckCircle2, Zap,
-  BarChart2, RefreshCw, Clock, FlaskConical
-} from 'lucide-react';
+import { useSimulation } from '../context/MachineContext';
+import { AreaChart, Area, ResponsiveContainer } from 'recharts';
 
-function CalibrateBtn({ onCalibrate }) {
-  const [flash, setFlash] = useState(false);
+const GROUPS = [
+  { key: 'vibration', label: 'Differential Vibration', color: '#38bdf8', sensors: [
+    { id:'V1', label:'Axis X-Front' }, { id:'V2', label:'Axis X-Rear' },
+    { id:'V3', label:'Axis Y-Left' }, { id:'V4', label:'Axis Y-Right' },
+    { id:'V5', label:'Axis Z-Upper' }, { id:'V6', label:'Axis Z-Lower' },
+  ]},
+  { key: 'force', label: 'Force / Load', color: '#a78bfa', sensors: [
+    { id:'L1', label:'Broach Entry' }, { id:'L2', label:'Mid-Stroke' },
+    { id:'L3', label:'Exit Zone' },  { id:'L4', label:'Return Force' },
+  ]},
+  { key: 'thermal', label: 'Thermal', color: '#fb923c', sensors: [
+    { id:'T1', label:'Spindle Bearing' }, { id:'T2', label:'Hydraulic Fluid' },
+    { id:'T3', label:'Tool Interface' },  { id:'T4', label:'Ambient' },
+  ]},
+  { key: 'acoustic', label: 'Acoustic', color: '#f472b6', sensors: [
+    { id:'A1', label:'Primary AE' }, { id:'A2', label:'Secondary AE' },
+  ]},
+  { key: 'process', label: 'Process', color: '#34d399', sensors: [
+    { id:'P1', label:'Hyd. Pressure' }, { id:'P2', label:'Supply Voltage' },
+  ]},
+];
+
+const UNITS = {
+  V1:'mm/s²', V2:'mm/s²', V3:'mm/s²', V4:'mm/s²', V5:'mm/s²', V6:'mm/s²',
+  L1:'N', L2:'N', L3:'N', L4:'N',
+  T1:'°C', T2:'°C', T3:'°C', T4:'°C',
+  A1:'dB', A2:'dB',
+  P1:'bar', P2:'V',
+};
+
+const RANGES = {
+  V1:[0,0.2], V2:[0,0.2], V3:[0,0.2], V4:[0,0.2], V5:[0,0.2], V6:[0,0.2],
+  L1:[0,80],  L2:[0,80],  L3:[0,80],  L4:[0,80],
+  T1:[20,90], T2:[20,90], T3:[20,90], T4:[20,90],
+  A1:[195,225], A2:[195,225],
+  P1:[18,28], P2:[4.8,5.1],
+};
+
+function MiniSparkline({ history, field, color }) {
+  const pts = history.slice(-20).map((h, i) => ({ i, v: h[field] ?? 0 }));
   return (
-    <button onClick={() => { onCalibrate(); setFlash(true); setTimeout(() => setFlash(false), 2500); }}
-      className={`flex items-center gap-2 text-xs px-4 py-2.5 rounded-xl border font-bold transition-all
-        ${flash ? 'bg-[#00e5ff]/15 border-[#00e5ff]/40 text-[#00e5ff]' : 'bg-[#c084fc]/10 border-[#c084fc]/40 text-[#c084fc] hover:bg-[#c084fc]/20'}`}>
-      {flash ? <><CheckCircle2 size={13}/> Baseline Saved!</> : <><Target size={13}/> Calibrate Tool</>}
-    </button>
+    <ResponsiveContainer width="100%" height={32}>
+      <AreaChart data={pts} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+        <Area type="monotone" dataKey="v" stroke={color} fill={color} fillOpacity={0.15} strokeWidth={1.5} dot={false} isAnimationActive={false}/>
+      </AreaChart>
+    </ResponsiveContainer>
   );
 }
 
-function StressBtn({ onTrigger, active }) {
-  return (
-    <button onClick={onTrigger} disabled={active}
-      className={`flex items-center gap-2 text-xs px-4 py-2.5 rounded-xl border font-bold transition-all
-        ${active ? 'bg-[#ffb4ab]/20 border-[#ffb4ab]/50 text-[#ffb4ab] animate-pulse cursor-not-allowed'
-                 : 'bg-[#ffb4ab]/10 border-[#ffb4ab]/30 text-[#ffb4ab] hover:bg-[#ffb4ab]/20'}`}>
-      <FlaskConical size={13}/>{active ? 'Stress Test Running…' : 'Stress Test'}
-    </button>
-  );
-}
+function SensorTile({ id, label, value, history, color }) {
+  const unit = UNITS[id] || '';
+  const [min, max] = RANGES[id] || [0, 100];
+  const pct = Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100));
+  const warn = pct > 75;
 
-function RULBar({ rul }) {
-  const color = rul > 60 ? '#00e5ff' : rul > 30 ? '#ffba38' : '#ffb4ab';
   return (
-    <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <RefreshCw size={14} className="text-[#ffba38]"/>
-          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">RUL — Remaining Useful Life</span>
-        </div>
-        <span className="text-[9px] text-[#849396] flex items-center gap-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] inline-block animate-pulse"/> Calculating real-time
-        </span>
+    <div className={`bg-slate-800/60 rounded-xl border p-3 transition-all
+      ${warn ? 'border-amber-500/50' : 'border-slate-700/40'}`}>
+      <div className="flex items-center justify-between mb-1">
+        <span className={`text-[9px] font-black uppercase tracking-widest ${warn ? 'text-amber-400' : 'text-slate-500'}`}>{id}</span>
+        <span className="text-[8px] text-slate-600">{label}</span>
       </div>
-      <div className="flex items-end gap-3 mb-3">
-        <span className="text-4xl font-black font-headline" style={{ color }}>{rul.toFixed(1)}</span>
-        <span className="text-[#849396] text-sm mb-1">%</span>
-        <span className="text-[10px] text-[#849396] mb-2 ml-auto">
-          ≈ {Math.round(rul * 50).toLocaleString()} cycles remaining
-        </span>
+      <div className={`text-lg font-black mb-1 ${warn ? 'text-amber-400' : 'text-slate-100'}`}>
+        {typeof value === 'number' ? value.toFixed(id.startsWith('L') ? 0 : 3) : '--'}
+        <span className="text-[9px] text-slate-500 ml-1">{unit}</span>
       </div>
-      <div className="h-4 bg-[#10141a] rounded-full overflow-hidden border border-[#3b494c]/20">
-        <div className="h-full rounded-full transition-all duration-700"
-          style={{ width: `${rul}%`, background: `linear-gradient(90deg,${color}88,${color})` }}/>
-      </div>
-      <div className="flex justify-between text-[9px] text-[#3b494c] mt-1.5">
-        <span>CRITICAL 0%</span>
-        <span className="text-[#849396]">Replace below 20%</span>
-        <span>HEALTHY 100%</span>
-      </div>
-    </div>
-  );
-}
-
-function EStopOverlay({ active, onReset }) {
-  if (!active) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-[#93000a]/50 animate-pulse pointer-events-none"/>
-      <div className="absolute inset-0 border-8 border-[#ffb4ab]/80 animate-pulse pointer-events-none"/>
-      <div className="relative z-10 bg-[#0a0d12]/95 backdrop-blur-md border-2 border-[#ffb4ab]/60 rounded-2xl p-8 max-w-md mx-4 text-center shadow-2xl">
-        <div className="text-5xl mb-4">🛑</div>
-        <div className="text-[10px] uppercase tracking-[0.3em] text-[#ffb4ab] mb-2">Autonomous Shutdown</div>
-        <h2 className="text-2xl font-black font-headline text-[#ffb4ab] mb-3">CHIP PACKING DETECTED</h2>
-        <p className="text-sm text-[#849396] leading-relaxed mb-5">
-          Current &amp; Pressure both spiked beyond threshold simultaneously.
-          Virtual relay opened — spindle power isolated.
-        </p>
-        <div className="bg-[#181c22] rounded-xl p-4 border border-[#ffb4ab]/20 mb-5 text-left">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-2">Relay Status</div>
-          <div className="flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-[#ffb4ab] animate-pulse"/>
-            <span className="text-[#ffb4ab] text-xs font-bold">OPEN — Spindle Isolated</span>
-          </div>
-          <div className="text-[10px] text-[#ffba38] mt-2">Action: Clear chips · Inspect tool edge · Regrind if worn</div>
-        </div>
-        <button onClick={onReset}
-          className="w-full py-3 rounded-xl border border-[#ffb4ab]/40 text-[#ffb4ab] text-sm font-bold hover:bg-[#ffb4ab]/10 transition-colors">
-          Reset System
-        </button>
+      <MiniSparkline history={history} field={id} color={warn ? '#f59e0b' : color}/>
+      <div className="h-1 bg-slate-700 rounded-full mt-1.5 overflow-hidden">
+        <div className="h-full rounded-full transition-all duration-500"
+          style={{ width: `${pct}%`, backgroundColor: warn ? '#f59e0b' : color }}/>
       </div>
     </div>
   );
 }
 
 export default function Dashboard() {
-  const { systemStatus, failureThreshold, resetStatus } = useMachine();
-  const { data, history, stressTest, calibrate, triggerStressTest, getDeviation, isCalibrated, rul } = useSimulation();
-
-  const prevBoth = useRef(false);
-  const { triggerEStop, triggerWarning } = useMachine();
-
-  const currDev  = isCalibrated && data ? getDeviation('current',  data.spindle_current_a)       : 0;
-  const pressDev = isCalibrated && data ? getDeviation('pressure',  data.hydraulic_pressure_bar)  : 0;
-  const bothExceed = currDev > failureThreshold && pressDev > failureThreshold;
-
-  useEffect(() => {
-    if (!isCalibrated) return;
-    if (bothExceed && !prevBoth.current && systemStatus !== 'ESTOP') {
-      triggerEStop('Critical Correlation Spike — Current & Pressure both exceeded threshold. Chip Packing suspected. E-Stop deployed.');
-    } else if (!bothExceed && (currDev > failureThreshold * 0.7 || pressDev > failureThreshold * 0.7) && systemStatus === 'ARMED') {
-      // only warn once per event
-    }
-    prevBoth.current = bothExceed;
-  }, [bothExceed, isCalibrated, systemStatus]);
-
-  const isEStop   = systemStatus === 'ESTOP';
-  const isWarning = systemStatus === 'WARNING';
+  const { data, history } = useSimulation();
 
   return (
-    <div className={`p-6 space-y-5 min-h-screen
-      ${isEStop   ? 'ring-4 ring-inset ring-[#ffb4ab]/60' : ''}
-      ${isWarning ? 'ring-2 ring-inset ring-[#ffba38]/40' : ''}`}>
-
-      <EStopOverlay active={isEStop} onReset={resetStatus}/>
-      <SystemStatusBar/>
-
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight">Health Pulse</h1>
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">
-            {data ? `Simulation active · ${new Date(data.timestamp).toLocaleTimeString()}` : 'Initializing…'}
-            {data?.spike_active && <span className="ml-2 text-[#ffb4ab] font-bold animate-pulse">● STRESS TEST ACTIVE</span>}
-          </div>
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          {data && <StatusBadge status={data.tool_status}/>}
-          <CalibrateBtn onCalibrate={calibrate}/>
-          <StressBtn onTrigger={triggerStressTest} active={stressTest}/>
-        </div>
+    <div className="p-6 space-y-6 min-h-screen">
+      <div>
+        <h1 className="text-2xl font-black text-slate-100">18-Sensor Telemetry</h1>
+        <p className="text-xs text-slate-500 mt-0.5">Real-time fusion grid · Random Forest feature space</p>
       </div>
 
-      {/* 5 gauges */}
-      <div className="bg-[#181c22] rounded-xl p-5 flex justify-around flex-wrap gap-4">
-        <GaugeCircle value={data?.temperature_c         ?? 0} max={100} unit="°C"   label="Temperature"    color={data?.temperature_c > 85 ? '#ffb4ab' : '#ff9259'}/>
-        <GaugeCircle value={data?.supply_voltage_v       ?? 0} max={6}   unit="V"   label="Voltage"        color="#4ade80"/>
-        <GaugeCircle value={data?.spindle_current_a      ?? 0} max={0.3} unit="A"   label="Motor Current"  color={data?.spike_active ? '#ffb4ab' : '#818cf8'}/>
-        <GaugeCircle value={data?.hydraulic_pressure_bar ?? 0} max={35}  unit="bar" label="Hyd. Pressure"  color={data?.spike_active ? '#ffb4ab' : '#00daf3'}/>
-        <GaugeCircle value={data?.wear_progression       ?? 0} max={1.5} unit="idx" label="Wear Index"     color="#ffba38"/>
-      </div>
-
-      <RULBar rul={rul}/>
-
-      {/* Metric cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {/* Key banner */}
+      <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
         {[
-          ['Temperature', data?.temperature_c?.toFixed(1)         ?? '--', '°C',   '#ff9259', Thermometer],
-          ['Voltage',     data?.supply_voltage_v?.toFixed(3)       ?? '--', 'V',    '#4ade80', Battery],
-          ['Current',     data?.spindle_current_a?.toFixed(4)      ?? '--', 'A',    '#818cf8', Zap],
-          ['Hyd. Press',  data?.hydraulic_pressure_bar?.toFixed(2) ?? '--', 'bar',  '#00daf3', BarChart2],
-        ].map(([label, val, unit, color, Icon]) => (
-          <div key={label} className="bg-[#1c2026] rounded-xl p-4 flex flex-col gap-2">
-            <div className="flex items-center gap-2">
-              <Icon size={14} style={{ color }}/>
-              <span className="text-[9px] uppercase tracking-[0.15em] text-[#849396]">{label}</span>
-              {data?.spike_active && (label === 'Current' || label === 'Hyd. Press') && (
-                <span className="ml-auto text-[9px] text-[#ffb4ab] font-bold animate-pulse">↑</span>
-              )}
-            </div>
-            <div className="text-2xl font-black font-headline text-[#c3f5ff]">
-              {val}<span className="text-[#849396] text-xs ml-1">{unit}</span>
-            </div>
+          ['Motor Current', data ? `${(data.spindle_current_a*1000).toFixed(0)} mA` : '--', '#38bdf8'],
+          ['Hyd. Pressure', data ? `${data.hydraulic_pressure_bar.toFixed(1)} bar` : '--', '#a78bfa'],
+          ['Spindle Torque', data ? `${data.spindle_torque_nm.toFixed(2)} N·m` : '--', '#f472b6'],
+          ['Temperature',   data ? `${data.temperature_c.toFixed(1)} °C` : '--', '#fb923c'],
+          ['Vib. Avg',      data ? `${data.vibAvg.toFixed(3)} mm/s²` : '--', '#34d399'],
+          ['Tool RUL',      data ? `${data.remaining_life_pct.toFixed(0)}%` : '--', '#fbbf24'],
+        ].map(([label, val, color]) => (
+          <div key={label} className="bg-slate-800/60 rounded-xl border border-slate-700/40 p-3 text-center">
+            <div className="text-[9px] text-slate-500 uppercase tracking-wider mb-1">{label}</div>
+            <div className="text-lg font-black" style={{ color }}>{val}</div>
           </div>
         ))}
       </div>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="bg-[#1c2026] rounded-xl p-4">
-          <LiveChart data={history} dataKey="spindle_current_a"      color="#818cf8" label="Motor Current (A)"       height={130}/>
+      {/* 18-sensor groups */}
+      {GROUPS.map(({ key, label, color, sensors }) => (
+        <div key={key}>
+          <div className="flex items-center gap-2 mb-3">
+            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: color }}/>
+            <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">{label}</span>
+            <span className="text-[9px] text-slate-600">({sensors.length} sensors)</span>
+          </div>
+          <div className={`grid gap-3 ${sensors.length <= 2 ? 'grid-cols-2' : sensors.length === 4 ? 'grid-cols-2 md:grid-cols-4' : 'grid-cols-2 md:grid-cols-3'}`}>
+            {sensors.map(({ id, label: sLabel }) => (
+              <SensorTile key={id} id={id} label={sLabel}
+                value={data?.[id] ?? null} history={history} color={color}/>
+            ))}
+          </div>
         </div>
-        <div className="bg-[#1c2026] rounded-xl p-4">
-          <LiveChart data={history} dataKey="hydraulic_pressure_bar" color="#00daf3" label="Hydraulic Pressure (bar)" height={130}/>
-        </div>
-      </div>
+      ))}
     </div>
   );
 }

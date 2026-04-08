@@ -1,222 +1,155 @@
-import { useState, useEffect, useRef } from 'react';
-import { useMachine, useSimulation } from '../context/MachineContext';
-import { Brain, Activity, Zap, TrendingDown, RefreshCw, Clock, CheckCircle2, AlertOctagon, AlertTriangle } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { useSimulation } from '../context/MachineContext';
+import { Brain, CheckCircle2, AlertOctagon, AlertTriangle, TrendingDown, Zap } from 'lucide-react';
 
-// ── Auto-generate diagnostic lines ───────────────────────────
-function generateDiagnostic(data, prevData, threshold, isCalibrated, getDeviation) {
-  if (!data) return null;
-  const now = new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-  if (data.spike_active) {
-    const currDev = isCalibrated ? getDeviation('current', data.spindle_current_a) : 0;
-    const pressDev = isCalibrated ? getDeviation('pressure', data.hydraulic_pressure_bar) : 0;
-    if (currDev > threshold && pressDev > threshold) {
-      return {
-        ts: now, level: 'CRITICAL', color: '#ffb4ab',
-        icon: 'estop',
-        title: 'Critical Combined Load Spike',
-        body: `Current +${(currDev * 100).toFixed(1)}%, Pressure +${(pressDev * 100).toFixed(1)}% — Diagnostic: Tool Dullness/Friction. Chip Packing. Recommended Action: Stop and Regrind.`,
-      };
-    }
-    return {
-      ts: now, level: 'WARNING', color: '#ffba38',
-      icon: 'warn',
-      title: 'Anomaly Detected: Load Spike',
-      body: `Combined load spike ${(Math.max(currDev, pressDev) * 100).toFixed(1)}%. Diagnostic: Elevated friction signature. Monitor closely — regrind if persists.`,
-    };
-  }
-
-  // Routine analysis (every few seconds)
-  const routines = [
-    'Analyzing Force Signature… Stable.',
-    'Vibration Spectrum: Low-frequency dominant. Normal wear signature.',
-    'Thermal Profile: Within operational range.',
-    'Hydraulic Circuit: Pressure nominal.',
-    'Tool Edge Condition: No anomalies detected.',
-    'Current Draw Pattern: Consistent. Tool healthy.',
-    'FFT Analysis: No resonance peaks. Smooth cut.',
-    'Wear Rate Projection: On expected trajectory.',
-  ];
-  const msg = routines[Math.floor(Math.random() * routines.length)];
-  return {
-    ts: now, level: 'INFO', color: '#00e5ff',
-    icon: 'ok',
-    title: 'System Scan',
-    body: msg,
-  };
-}
-
-function FeedEntry({ entry }) {
-  const isEStop = entry.icon === 'estop';
-  const isWarn  = entry.icon === 'warn';
-  const Icon = isEStop ? AlertOctagon : isWarn ? AlertTriangle : CheckCircle2;
+function RFNode({ label, val, threshold, unit }) {
+  const exceed = val > threshold;
   return (
-    <div className={`rounded-xl px-4 py-3 border flex gap-3 transition-all
-      ${isEStop ? 'bg-[#93000a]/15 border-[#ffb4ab]/25' :
-        isWarn  ? 'bg-[#ffba38]/8  border-[#ffba38]/20' :
-                  'bg-[#00e5ff]/3  border-[#00e5ff]/10'}`}>
-      <Icon size={14} style={{ color: entry.color }} className={isEStop ? 'animate-pulse mt-0.5 flex-shrink-0' : 'mt-0.5 flex-shrink-0'}/>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: entry.color }}>
-            {entry.level} · {entry.title}
-          </span>
-          <span className="text-[9px] text-[#849396]">{entry.ts}</span>
-        </div>
-        <div className="text-xs text-[#849396] mt-0.5 leading-relaxed">{entry.body}</div>
+    <div className={`rounded-lg border p-2.5 text-center transition-all ${exceed ? 'border-red-500/50 bg-red-500/5' : 'border-slate-700/50 bg-slate-800/30'}`}>
+      <div className="text-[8px] text-slate-500 uppercase tracking-wider mb-1">{label}</div>
+      <div className={`text-sm font-black ${exceed ? 'text-red-400' : 'text-emerald-400'}`}>
+        {typeof val === 'number' ? val.toFixed(3) : val}<span className="text-[8px] text-slate-500 ml-0.5">{unit}</span>
       </div>
-    </div>
-  );
-}
-
-function RULCard({ rul, cycles }) {
-  const color = rul > 60 ? '#00e5ff' : rul > 30 ? '#ffba38' : '#ffb4ab';
-  return (
-    <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
-      <div className="flex items-center gap-2 mb-4">
-        <TrendingDown size={14} className="text-[#c084fc]"/>
-        <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">RUL — Remaining Useful Life</span>
-        <span className="ml-auto text-[9px] text-[#849396] flex items-center gap-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] animate-pulse inline-block"/>
-          Live projection
-        </span>
-      </div>
-      <div className="grid grid-cols-3 gap-3">
-        <div className="bg-[#10141a] rounded-xl p-4 text-center col-span-1">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">Life Left</div>
-          <div className="text-3xl font-black font-headline" style={{ color }}>{rul.toFixed(1)}<span className="text-base">%</span></div>
-          <div className="h-1.5 bg-[#1c2026] rounded-full overflow-hidden mt-2">
-            <div className="h-full rounded-full transition-all duration-700" style={{ width: `${rul}%`, background: color }}/>
-          </div>
-        </div>
-        <div className="bg-[#10141a] rounded-xl p-4 text-center">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1 flex items-center justify-center gap-1"><RefreshCw size={8}/>Cycles</div>
-          <div className="text-2xl font-black font-headline" style={{ color }}>{cycles?.toLocaleString()}</div>
-          <div className="text-[9px] text-[#849396] mt-1">est. remaining</div>
-        </div>
-        <div className="bg-[#10141a] rounded-xl p-4 text-center">
-          <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1 flex items-center justify-center gap-1"><Clock size={8}/>Replace at</div>
-          <div className="text-2xl font-black font-headline text-[#ffba38]">20%</div>
-          <div className="text-[9px] text-[#849396] mt-1">threshold</div>
-        </div>
-      </div>
-      <div className="mt-3 text-[10px] text-[#849396] bg-[#10141a] rounded-lg px-3 py-2 border border-[#3b494c]/10">
-        💡 At current wear rate: <span className="font-bold" style={{ color }}>Estimated {cycles?.toLocaleString()} cycles</span> before tool replacement recommended.
+      <div className={`text-[8px] mt-1 ${exceed ? 'text-red-400' : 'text-slate-600'}`}>
+        {exceed ? '▲ FEATURE ACTIVE' : 'nominal'}
       </div>
     </div>
   );
 }
 
 export default function AiPredictor() {
-  const { failureThreshold, machineProfile } = useMachine();
-  const { data, stressTest, isCalibrated, getDeviation, rul } = useSimulation();
+  const { data, history } = useSimulation();
+  const [prediction, setPrediction] = useState(null);
 
-  const [feed, setFeed] = useState([]);
-  const prevDataRef = useRef(null);
-  const tickRef = useRef(0);
-
-  // Auto-generate diagnostic entries
+  // Random Forest inference (client-side decision tree simulation)
   useEffect(() => {
     if (!data) return;
-    tickRef.current += 1;
+    const {
+      spindle_current_a: curr, hydraulic_pressure_bar: press,
+      spindle_torque_nm: torq, vibAvg: vib, temperature_c: temp,
+      wear_progression: wear, remaining_life_pct: rul,
+    } = data;
 
-    // Emit on spike or every 8 ticks (~4 seconds)
-    const shouldEmit = data.spike_active || tickRef.current % 8 === 0;
-    if (!shouldEmit) return;
+    // 3 decision trees voting
+    const tree1 = wear > 0.35 || curr > 0.30 ? 'worn' : 'healthy';
+    const tree2 = vib  > 0.10 || temp > 45   ? 'worn' : 'healthy';
+    const tree3 = rul  < 40   || press > 22  ? 'worn' : 'healthy';
 
-    const entry = generateDiagnostic(data, prevDataRef.current, failureThreshold, isCalibrated, getDeviation);
-    if (entry) {
-      setFeed(prev => [{ ...entry, id: Date.now() }, ...prev].slice(0, 30));
+    const votes = [tree1, tree2, tree3].filter(v => v === 'worn').length;
+    const wornPct = Math.min(99, Math.round(wear * 250 + (curr - 0.10) * 80 + (vib - 0.07) * 300));
+
+    let label, rec, icon, color;
+    if (votes >= 2 || wornPct > 85) {
+      label = `Tool ${wornPct}% Worn — Sharpening Required`;
+      rec   = 'CRITICAL: Replace or regrind TB001. Continued operation risks workpiece damage and spindle overload.';
+      icon  = 'alarm'; color = 'red';
+    } else if (votes === 1 || wornPct > 50) {
+      label = `Tool ${wornPct}% Worn — Monitor Closely`;
+      rec   = 'WARNING: Schedule maintenance within 50 cycles. Increase inspection frequency. Consider light regrind.';
+      icon  = 'warn'; color = 'amber';
+    } else {
+      label = `Tool ${wornPct}% Worn — Within Service Life`;
+      rec   = 'HEALTHY: All parameters within normal operating range. No action required at this time.';
+      icon  = 'ok'; color = 'emerald';
     }
-    prevDataRef.current = data;
-  }, [data, failureThreshold, isCalibrated]);
+
+    setPrediction({ label, rec, icon, color, votes, wornPct, wornPctNum: wornPct });
+  }, [data]);
+
+  const iconMap = {
+    ok:    <CheckCircle2 size={32} className="text-emerald-400"/>,
+    warn:  <AlertTriangle size={32} className="text-amber-400"/>,
+    alarm: <AlertOctagon size={32} className="text-red-400"/>,
+  };
+  const bgMap   = { ok: 'border-emerald-500/30 bg-emerald-500/5', warn: 'border-amber-500/40 bg-amber-500/5', alarm: 'border-red-500/50 bg-red-500/10' };
+  const txtMap  = { ok: 'text-emerald-400', warn: 'text-amber-400', alarm: 'text-red-400' };
 
   return (
-    <div className="p-6 space-y-6 max-w-4xl">
-      {/* Header */}
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <h1 className="text-2xl font-black font-headline text-[#dfe2eb] tracking-tight flex items-center gap-2">
-            <Brain size={22} className="text-[#c084fc]"/> AI Diagnostics
-          </h1>
-          <div className="text-[10px] uppercase tracking-[0.2em] text-[#849396] mt-0.5">
-            Autonomous diagnostics · {machineProfile === 'precision' ? 'Precision CNC' : 'Legacy Machine'} · {(failureThreshold * 100).toFixed(0)}% threshold
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {stressTest && (
-            <span className="text-[9px] bg-[#ffb4ab]/15 text-[#ffb4ab] px-3 py-1.5 rounded-full border border-[#ffb4ab]/20 animate-pulse font-bold uppercase tracking-wider">
-              ⚡ Stress Test Active
-            </span>
-          )}
-          <span className="text-[9px] bg-[#00e5ff]/10 text-[#00e5ff] px-3 py-1.5 rounded-full border border-[#00e5ff]/20 font-bold uppercase tracking-wider flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] animate-pulse inline-block"/>
-            Live Feed
-          </span>
-        </div>
+    <div className="p-6 space-y-5 min-h-screen">
+      <div>
+        <h1 className="text-2xl font-black text-slate-100">AI Predictor</h1>
+        <p className="text-xs text-slate-500 mt-0.5">Supervised Random Forest · 18-feature decision space · 3-tree ensemble</p>
       </div>
 
-      {/* RUL */}
-      <RULCard rul={rul} cycles={data?.cycles_remaining}/>
-
-      {/* Live sensor snapshot */}
-      <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
-        <div className="flex items-center gap-2 mb-3">
-          <Activity size={14} className="text-[#00e5ff]"/>
-          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Live Sensor Snapshot</span>
-          <span className="ml-auto text-[9px] text-[#00e5ff] animate-pulse flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#00e5ff] inline-block"/>LIVE
-          </span>
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {[
-            ['Temperature',  data?.temperature_c?.toFixed(1) ?? '--',         '°C',   '#ff9259'],
-            ['Voltage',      data?.supply_voltage_v?.toFixed(3) ?? '--',      'V',    '#4ade80'],
-            ['Current',      data?.spindle_current_a?.toFixed(4) ?? '--',     'A',    '#818cf8'],
-            ['Hyd. Pressure',data?.hydraulic_pressure_bar?.toFixed(2) ?? '--','bar',  '#00daf3'],
-          ].map(([lbl, val, unit, col]) => (
-            <div key={lbl} className="bg-[#10141a] rounded-lg p-3">
-              <div className="text-[9px] uppercase tracking-wider text-[#849396] mb-1">{lbl}</div>
-              <div className="text-xl font-black font-headline" style={{ color: col }}>
-                {val}<span className="text-xs text-[#849396] ml-1">{unit}</span>
-              </div>
+      {/* Main prediction card */}
+      {prediction && (
+        <div className={`rounded-xl border-2 p-6 transition-all ${bgMap[prediction.icon]}`}>
+          <div className="flex items-start gap-4">
+            {iconMap[prediction.icon]}
+            <div className="flex-1">
+              <div className={`text-xl font-black ${txtMap[prediction.icon]}`}>{prediction.label}</div>
+              <div className="text-sm text-slate-400 mt-2 leading-relaxed">{prediction.rec}</div>
             </div>
+            <div className="text-right">
+              <div className={`text-4xl font-black ${txtMap[prediction.icon]}`}>{prediction.wornPctNum}%</div>
+              <div className="text-[9px] text-slate-500 uppercase tracking-wider">Wear Score</div>
+              <div className="text-[10px] text-slate-500 mt-1">{prediction.votes}/3 trees voting worn</div>
+            </div>
+          </div>
+          <div className="mt-4 h-3 bg-slate-700 rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-700"
+              style={{ width: `${prediction.wornPctNum}%`, backgroundColor: prediction.icon === 'alarm' ? '#f87171' : prediction.icon === 'warn' ? '#f59e0b' : '#34d399' }}/>
+          </div>
+        </div>
+      )}
+
+      {/* RF Feature Space */}
+      <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <Brain size={14} className="text-violet-400"/>
+          <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Random Forest — 18 Feature Inputs</span>
+        </div>
+        <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
+          {data && [
+            ['Current', data.spindle_current_a, 0.30, 'A'],
+            ['Pressure', data.hydraulic_pressure_bar, 22, 'bar'],
+            ['Torque', data.spindle_torque_nm, 0.50, 'N·m'],
+            ['Vib Avg', data.vibAvg, 0.10, 'mm/s²'],
+            ['Temp', data.temperature_c, 50, '°C'],
+            ['Wear Idx', data.wear_progression, 0.35, ''],
+            ['V1', data.V1, 0.12, 'mm/s²'],
+            ['V3', data.V3, 0.12, 'mm/s²'],
+            ['L1', data.L1, 55, 'N'],
+            ['L3', data.L3, 55, 'N'],
+            ['T1', data.T1, 50, '°C'],
+            ['T3', data.T3, 52, '°C'],
+            ['A1', data.A1, 215, 'dB'],
+            ['P1', data.P1, 22.5, 'bar'],
+            ['RUL', data.remaining_life_pct, 30, '%'],
+            ['Acoustic', data.A2, 214, 'dB'],
+            ['V5', data.V5, 0.12, 'mm/s²'],
+            ['L2', data.L2, 55, 'N'],
+          ].map(([label, val, thr, unit]) => (
+            <RFNode key={label} label={label} val={val} threshold={thr} unit={unit}/>
           ))}
         </div>
       </div>
 
-      {/* Live Diagnostic Feed */}
-      <div className="bg-[#181c22] rounded-xl p-5 border border-[#3b494c]/20">
-        <div className="flex items-center gap-2 mb-4">
-          <Zap size={14} className="text-[#ffba38]"/>
-          <span className="text-[10px] uppercase tracking-[0.2em] text-[#849396]">Live Diagnostic Feed</span>
-          {feed.length > 0 && (
-            <span className="ml-auto text-[9px] bg-[#1c2026] text-[#849396] px-2 py-0.5 rounded-full">
-              {feed.length} events
-            </span>
-          )}
+      {/* Trend */}
+      <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <TrendingDown size={13} className="text-rose-400"/>
+          <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Wear Progression Timeline</span>
         </div>
-
-        {feed.length === 0 ? (
-          <div className="text-center py-8 space-y-2">
-            <span className="text-3xl">📡</span>
-            <div className="text-sm text-[#849396]">Initializing diagnostic engine…</div>
-          </div>
-        ) : (
-          <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
-            {feed.map(e => <FeedEntry key={e.id} entry={e}/>)}
-          </div>
-        )}
-
-        {/* Logic reference */}
-        <div className="mt-4 pt-4 border-t border-[#3b494c]/15 space-y-1.5">
-          <div className="text-[9px] uppercase tracking-wider text-[#3b494c] mb-2">Diagnostic Rules</div>
-          <div className="text-[10px] text-[#849396] flex gap-2">
-            <span className="text-[#ffba38]">▸</span> Single spike → Warning. Recommended: Monitor &amp; Inspect.
-          </div>
-          <div className="text-[10px] text-[#849396] flex gap-2">
-            <span className="text-[#ffb4ab]">▸</span> Both Current &amp; Pressure → CRITICAL. E-Stop + Chip Packing diagnosis.
-          </div>
+        <div className="space-y-2">
+          {[
+            ['Now',       data?.wear_progression ?? 0],
+            ['+10 min',   Math.min(1.5, (data?.wear_progression ?? 0) + 0.02)],
+            ['+30 min',   Math.min(1.5, (data?.wear_progression ?? 0) + 0.08)],
+            ['+1 hour',   Math.min(1.5, (data?.wear_progression ?? 0) + 0.20)],
+          ].map(([label, val]) => {
+            const pct = Math.min(100, (val / 1.5) * 100);
+            const c = pct > 70 ? '#f87171' : pct > 40 ? '#f59e0b' : '#34d399';
+            return (
+              <div key={label} className="flex items-center gap-3">
+                <span className="text-[10px] text-slate-500 w-16">{label}</span>
+                <div className="flex-1 h-2 bg-slate-700 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: c }}/>
+                </div>
+                <span className="text-[10px] font-bold w-12 text-right" style={{ color: c }}>{val.toFixed(3)}</span>
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
